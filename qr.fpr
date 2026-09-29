@@ -1,16 +1,20 @@
 # Native QRepo. Repository policy is FP-RISC; posix.c supplies file safety.
 unsafe base.
+
 Program = use "std/program".
-Qfs.sha256 : String -> String .
 Clock = use "std/clock".
 Set = use "std/set".
 Merge = use "merge".
-Qfs.output : String -> Result Unit String .
+
 Encoding = use "std/encoding".
 Tcp = use "std/tcp".
 ST = use "std/stream".
 Proc = use "std/proc".
 Bin = use "std/binary".
+
+# Qfs.sha256 and output moved here.
+Qfs.sha256 : String -> String .
+Qfs.output : String -> Result Unit String .
 Qfs.rmdir : String -> Result Unit String .
 Qfs.end : Unit -> Unit .
 Qfs.remove : String -> Result Unit String .
@@ -20,6 +24,7 @@ Qfs.write : String -> String -> Int -> Result Unit String .
 Qfs.kind : String -> Result Int String .
 Qfs.list : String -> Result (List String) String .
 Qfs.mkdir : String -> Result Unit String .
+
 readPath p = need (Qfs.read p).
 exists p = need (Qfs.kind p) != -1.
 readPathOr fallback p = if exists p then readPath p else fallback.
@@ -79,8 +84,10 @@ save : String -> String -> String -> String -> Unit .
 save root kind body id =
   raw = kind + "\n" + body;
   path = "objects/" + id;
-  if exists (meta root path) then check (get root path == raw) "immutable object collision/corruption"
-  else need (Qfs.write (meta root path) raw 1).
+  if exists (meta root path) then
+    check (get root path == raw) "immutable object collision/corruption"
+  else
+    need (Qfs.write (meta root path) raw 1).
 
 head : String -> String .
 head root = S.trim (get root "HEAD").
@@ -101,8 +108,7 @@ reserved name = S.toLower name == ".qrepo" or S.startsWith ".qr-tmp-" name.
 validPath p = p != "" and not (S.startsWith "/" p) and L.all (fn x -> x != "" and x != "." and x != ".." and not (reserved x)) (S.split "/" p).
 digitsOnly t = t != "" and L.all (fn c -> c >= 48 and c <= 57) (L.map (charAt t) (L.range 1 (strlen t))).
 # ".qr-tmp-<pid>-<serial>", exactly as posix.c names them
-isTemp name = if not (S.startsWith ".qr-tmp-" name) then False else
-  (case S.split "-" (substr name 9 (strlen name - 8)) of [a, b] -> digitsOnly a and digitsOnly b | _ -> False).
+isTemp name = if not (S.startsWith ".qr-tmp-" name) then False else (case S.split "-" (substr name 9 (strlen name - 8)) of [a, b] -> digitsOnly a and digitsOnly b | _ -> False).
 rules root = L.filter (fn x -> x != "" and not (S.startsWith "#" x)) (L.map S.trim (S.split "\n" (readPathOr "" (".qrepoignore")))).
 ruleMatches rule path = if S.endsWith "/" rule then S.startsWith rule (path + "/") else path == rule.
 ignored rs path = path == ".qrepo" or L.any (fn rule -> ruleMatches rule path) rs.
@@ -123,9 +129,8 @@ walk root rel rs = L.concat (L.map (fn name ->
     if kind == 1 then walk root path rs else
     if kind != 0 then [Skipped path "a symlink or special file"] else
     if isTemp name then dropTemp path else
-    if reserved name then [Skipped path "a reserved name"] else
-      body = readPath path;
-      [File path body (identity "blob" body)]) (ls rel)).
+    if reserved name then [Skipped path "a reserved name"]
+    else body = readPath path; [File path body (identity "blob" body)]) (ls rel)).
 
 dropTemp path = _ = need (Qfs.remove path); [].
 walkAll root = walk root "" (rules root).
@@ -152,7 +157,9 @@ status root =
   paths = changes old now;
   _ = L.map print (skips seen);
   _ = print (if L.isEmpty paths then "clean" else S.join "\n" (L.map (fn p -> (if field p old == J.Null then "A " else if field p now == J.Null then "D " else "M ") + p) paths));
-  if not (exists (meta root "remote.json")) then print "sync: local-only; no remote configured" else
+  if not (exists (meta root "remote.json")) then
+    print "sync: local-only; no remote configured"
+  else
     observed = S.trim (readPathOr "" (meta root "REMOTE_HEAD"));
     print (if observed == head root then "sync: matches last observed remote (use fetch to refresh)" else "sync: differs from last observed remote (use pull/push)").
 
@@ -369,8 +376,7 @@ ids value = case value of J.Sequence xs -> L.filter validId (L.concat (L.map (fn
 ancestors root tip = ancestorsGo root (if tip == "" then [] else [tip]) Set.strings.
 ancestorsGo root todo seen = case todo of
     [] -> seen
-  | id :: rest -> if Set.member id seen then ancestorsGo root rest seen else
-      ancestorsGo root (L.append (parents (record root id)) rest) (Set.insert id seen).
+  | id :: rest -> if Set.member id seen then ancestorsGo root rest seen else ancestorsGo root (L.append (parents (record root id)) rest) (Set.insert id seen).
 isAncestor root older newer = older == "" or Set.member older (ancestors root newer).
 
 # The worker: ONE request on stdin, its reply on stdout, then exit.  The
