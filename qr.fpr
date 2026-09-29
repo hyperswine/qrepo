@@ -1,0 +1,451 @@
+# Native QRepo. Repository policy is FP-RISC; posix.c supplies file safety.
+unsafe base.
+Program = use "std/program".
+Qfs.sha256 : String -> String .
+Clock = use "std/clock".
+Set = use "std/set".
+Merge = use "merge".
+Qfs.output : String -> Result Unit String .
+Encoding = use "std/encoding".
+Qnet.exchange : Int -> String -> Result String String .
+Qnet.request : Unit -> Result String String .
+Qnet.reply : String -> Result Unit String .
+Qnet.serve : String -> Int -> Result Unit String .
+Qfs.end : Unit -> Unit .
+Qfs.remove : String -> Result Unit String .
+Qfs.begin : String -> Int -> Result Unit String .
+Qfs.read : String -> Result String String .
+Qfs.write : String -> String -> Int -> Result Unit String .
+Qfs.kind : String -> Result Int String .
+Qfs.list : String -> Result (List String) String .
+Qfs.mkdir : String -> Result Unit String .
+readPath p = need (Qfs.read p).
+exists p = need (Qfs.kind p) != -1.
+readPathOr fallback p = if exists p then readPath p else fallback.
+writePath p s = need (Qfs.write p s 0).
+mkdirp p = need (Qfs.mkdir p).
+isDir p = need (Qfs.kind p) == 1.
+ls p = need (Qfs.list p).
+J = use "std/json".
+S = use "std/string".
+L = use "std/list".
+M = use "std/map".
+O = use "std/option".
+Ord = use "std/order".
+
+need r = case r of Ok x -> x | Err e -> Program.fail 1 e.
+check b e = if b then Unit else Program.fail 1 e.
+text v = case v of J.Text s -> s | _ -> Program.fail 1 "expected JSON string".
+field : String -> J.Value -> J.Value .
+field k j = O.withDefault J.Null (J.field k j).
+obj : List (String, J.Value) -> J.Value .
+obj xs = J.object xs.
+
+encode : J.Value -> String .
+encode = J.render.
+
+parse : String -> J.Value .
+parse s = need (J.parse s).
+pairs : J.Value -> List (String, J.Value) .
+pairs j = case j of J.Object m -> M.entries m | _ -> Program.fail 1 "expected JSON object".
+meta : String -> String -> String .
+meta root p = ".qrepo/" + p.
+
+get : String -> String -> String .
+get root p = readPath (meta root p).
+put : String -> String -> String -> Unit .
+put root p body = writePath (meta root p) body.
+
+sha : String -> String .
+sha bytes = Qfs.sha256 bytes.
+
+# Domain separation distinguishes content, snapshots, and checkpoint records.
+identity : String -> String -> String .
+identity kind body = sha (kind + "\n" + body).
+
+hexChar c = (c >= 48 and c <= 57) or (c >= 97 and c <= 102).
+validId id = strlen id == 64 and L.all hexChar (L.map (charAt id) (L.range 1 64)).
+
+load : String -> String -> String -> String .
+load root kind id =
+  _ = check (validId id) "invalid object id";
+  raw = get root ("objects/" + id);
+  prefix = kind + "\n";
+  _ = check (S.startsWith prefix raw and sha raw == id) "object integrity failure";
+  substr raw (strlen prefix + 1) (strlen raw - strlen prefix).
+
+save : String -> String -> String -> String -> Unit .
+save root kind body id =
+  raw = kind + "\n" + body;
+  path = "objects/" + id;
+  if exists (meta root path) then check (get root path == raw) "immutable object collision/corruption"
+  else need (Qfs.write (meta root path) raw 1).
+
+head : String -> String .
+head root = S.trim (get root "HEAD").
+
+record : String -> String -> J.Value .
+record root id = parse (load root "commit" id).
+
+snapshot : String -> String -> J.Value .
+snapshot root id = if id == "" then obj [] else
+  rec = record root id;
+  parse (load root "tree" (text (field "root_state" rec))).
+
+validPath p = p != "" and not (S.startsWith "/" p) and L.all (fn x -> x != "" and x != "." and x != ".." and x != ".qrepo") (S.split "/" p).
+rules root = L.filter (fn x -> x != "" and not (S.startsWith "#" x)) (L.map S.trim (S.split "\n" (readPathOr "" (".qrepoignore")))).
+ruleMatches rule path = if S.endsWith "/" rule then S.startsWith rule (path + "/") else path == rule.
+ignored rs path = path == ".qrepo" or L.any (fn rule -> ruleMatches rule path) rs.
+
+walk : String -> String -> List String -> List (String, String, String) .
+walk root rel rs = L.concat (L.map (fn name ->
+  path = if rel == "" then name else rel + "/" + name;
+  if ignored rs path then [] else
+    _ = check (validPath path) "unsafe working path";
+    if isDir path then walk root path rs
+    else _ = check (need (Qfs.kind path) == 0) "unsupported symlink or special file"; body = readPath path; [(path, body, identity "blob" body)]) (ls rel)).
+
+scan : String -> List (String, String, String) .
+scan root = walk root "" (rules root).
+
+entry (p, body, id) = (p, J.Text id).
+key (k, v) = k.
+tree : List (String, String, String) -> J.Value .
+tree files = obj (L.map entry files).
+keys : J.Value -> J.Value -> List String .
+keys a b = Set.toList (Set.fromList Ord.string (L.append (L.map key (pairs a)) (L.map key (pairs b)))).
+
+changes : J.Value -> J.Value -> List String .
+changes a b = L.filter (fn p -> field p a != field p b) (keys a b).
+
+status : String -> Unit .
+status root =
+  old = snapshot root (head root);
+  now = tree (scan root);
+  paths = changes old now;
+  _ = print (if L.isEmpty paths then "clean" else S.join "\n" (L.map (fn p -> (if field p old == J.Null then "A " else if field p now == J.Null then "D " else "M ") + p) paths));
+  if not (exists (meta root "remote.json")) then print "sync: local-only; no remote configured" else
+    observed = S.trim (readPathOr "" (meta root "REMOTE_HEAD"));
+    print (if observed == head root then "sync: matches last observed remote (use fetch to refresh)" else "sync: differs from last observed remote (use pull/push)").
+
+init : String -> Unit .
+init root =
+  _ = check (not (exists (meta root "config.json"))) "already initialized";
+  _ = mkdirp (meta root "objects");
+  _ = put root "HEAD" "";
+  _ = put root "tags.json" (encode (obj []));
+  _ = put root "config.json" (encode (obj [("format", J.Integer 2), ("mode", J.Text "local-only")]));
+  print "initialized native local QRepo (format 2)".
+
+commit : String -> String -> Unit .
+commit root message = commitWith root message (if head root == "" then [] else [head root]) False.
+commitWith root message commitParents allowSame =
+  _ = check (message != "") "commit message required";
+  parent = head root;
+  old = snapshot root parent;
+  files = scan root;
+  state = tree files;
+  _ = check (allowSame or parent == "" or not (L.isEmpty (changes old state))) "nothing changed";
+  body = encode state;
+  stateId = identity "tree" body;
+  rec = obj [("root_state", J.Text stateId), ("parents", J.Sequence (L.map J.Text commitParents)), ("author", J.Text "local"), ("timestamp", J.Integer (Clock.now Unit)), ("message", J.Text message), ("metadata", obj [])];
+  recBody = encode rec;
+  id = identity "commit" recBody;
+  _ = L.map (fn item -> case item of (_, data, key) -> save root "blob" data key) files;
+  _ = save root "tree" body stateId;
+  _ = save root "commit" recBody id;
+  _ = put root "HEAD" id;
+  print "local checkpoint: {id}".
+
+parents rec = case field "parents" rec of J.Sequence xs -> L.map text xs | _ -> Program.fail 1 "invalid parents".
+
+history : String -> String -> Unit .
+history root id = if id == "" then Unit else
+  rec = record root id;
+  _ = print (id + " " + text (field "message" rec));
+  case parents rec of [] -> Unit | p :: _ -> history root p.
+
+resolveId root name = if name == "HEAD" then head root else if validId name then name else
+  text (field name (parse (get root "tags.json"))).
+
+tag : String -> String -> Unit .
+tag root name =
+  _ = check (name != "" and name != "HEAD" and not (validId name)) "invalid tag name";
+  id = head root;
+  _ = check (id != "") "no checkpoint to tag";
+  tags = parse (get root "tags.json");
+  _ = check (field name tags == J.Null) "tags are immutable";
+  put root "tags.json" (encode (obj (L.append (pairs tags) [(name, J.Text id)]))).
+
+showFile : String -> String -> String -> String .
+showFile root rev path =
+  _ = check (validPath path) "unsafe path";
+  state = snapshot root (resolveId root rev);
+  load root "blob" (text (field path state)).
+
+restore : String -> String -> String -> Bool -> Unit .
+restore root rev path force =
+  body = showFile root rev path;
+  baseline = field path (snapshot root (head root));
+  current = if exists (path) then J.Text (identity "blob" (readPath path)) else J.Null;
+  _ = check (force or current == baseline or current == J.Null) "restore would overwrite local edits; use --force";
+  _ = makeParents (S.split "/" path) "";
+  writePath path body.
+
+makeParents parts prefix = case parts of
+    [] -> Unit
+  | _ :: [] -> Unit
+  | name :: rest ->
+      path = if prefix == "" then name else prefix + "/" + name;
+      _ = mkdirp path;
+      makeParents rest path.
+
+ignore : String -> String -> Unit .
+ignore root rule =
+  path = if S.endsWith "/" rule then substr rule 1 (strlen rule - 1) else rule;
+  _ = check (validPath path and not (S.startsWith "#" rule)) "ignore expects a root-relative path or directory/";
+  before = readPathOr "" (".qrepoignore");
+  writePath (".qrepoignore") (before + (if before == "" or S.endsWith "\n" before then "" else "\n") + rule + "\n").
+
+diff : String -> List Unit .
+diff root =
+  old = snapshot root (head root);
+  files = scan root;
+  now = tree files;
+  bodies = M.fromList Ord.string (L.map (fn item -> case item of (p, body, _) -> (p, body)) files);
+  L.map (fn p ->
+    before = if field p old == J.Null then "" else load root "blob" (text (field p old));
+    after = O.withDefault "" (M.get p bodies);
+    print ("--- " + p + " (checkpoint)\n" + before + "\n+++ " + p + " (working)\n" + after)) (changes old now).
+
+# ---- Experimental loopback remote protocol, version 1 -----------------------
+# Immutable object transfer followed by locked compare-and-swap of HEAD.
+seqValues value = case value of J.Sequence xs -> xs | _ -> Program.fail 1 "expected array".
+portOf value = case S.toInt value of Ok n -> if n > 0 and n < 65536 then n else Program.fail 2 "invalid port" | Err _ -> Program.fail 2 "invalid port".
+remotePort root = case field "port" (parse (get root "remote.json")) of J.Integer n -> n | _ -> Program.fail 1 "invalid remote port".
+remoteCall port body =
+  response = parse (need (Qnet.exchange port (encode body)));
+  _ = check (field "version" response == J.Integer 1) "unsupported remote protocol";
+  _ = check (field "ok" response == J.Boolean True) (case field "error" response of J.Text why -> why | _ -> "remote refused request");
+  response.
+response values = obj (L.append [("version", J.Integer 1), ("ok", J.Boolean True)] values).
+refusal message = obj [("version", J.Integer 1), ("ok", J.Boolean False), ("error", J.Text message)].
+
+# Validate a tree before it can supply any working paths or be published.
+validateState state =
+  _ = L.map (fn item -> case item of (p, id) ->
+    _ = check (validPath p and not (S.contains (chr 0) p)) "unsafe remote path";
+    _ = check (validId (text id)) "invalid blob id";
+    checkPrefixes (S.split "/" p) "" state) (pairs state);
+  Unit.
+checkPrefixes parts prefix state = case parts of
+    [] -> Unit
+  | _ :: [] -> Unit
+  | name :: rest ->
+      p = if prefix == "" then name else prefix + "/" + name;
+      _ = check (field p state == J.Null) "file/directory collision in tree";
+      checkPrefixes rest p state.
+closure root tip = graph root (if tip == "" then [] else [tip]) Set.strings Set.strings.
+graph root todo seen objects = case todo of
+    [] -> Set.toList objects
+  | id :: rest -> if Set.member id seen then graph root rest seen objects else
+      rec = record root id;
+      ps = parents rec;
+      _ = check (L.length ps <= 2 and L.all validId ps) "invalid commit parents";
+      treeId = text (field "root_state" rec);
+      state = parse (load root "tree" treeId);
+      _ = validateState state;
+      blobIds = L.map (fn item -> case item of (_, v) -> text v) (pairs state);
+      _ = L.map (fn bid -> if Set.member bid objects then Unit else _ = load root "blob" bid; Unit) blobIds;
+      more = Set.insertAll (id :: treeId :: blobIds) objects;
+      graph root (L.append ps rest) (Set.insert id seen) more.
+pack root tip = J.Sequence (L.map (fn id -> obj [("id", J.Text id), ("data", J.Text (Encoding.base64 (get root ("objects/" + id))))]) (closure root tip)).
+importPack root value =
+  _ = L.map (fn item ->
+    id = text (field "id" item);
+    raw = need (Encoding.fromBase64 (text (field "data" item)));
+    _ = check (validId id and sha raw == id) "incoming object hash mismatch";
+    _ = check (S.startsWith "blob\n" raw or S.startsWith "tree\n" raw or S.startsWith "commit\n" raw) "invalid incoming object kind";
+    path = meta root ("objects/" + id);
+    if exists path then check (readPath path == raw) "immutable object corruption" else need (Qfs.write path raw 1)) (seqValues value);
+  Unit.
+ancestors root tip = ancestorsGo root (if tip == "" then [] else [tip]) Set.strings.
+ancestorsGo root todo seen = case todo of
+    [] -> seen
+  | id :: rest -> if Set.member id seen then ancestorsGo root rest seen else
+      ancestorsGo root (L.append (parents (record root id)) rest) (Set.insert id seen).
+isAncestor root older newer = older == "" or Set.member older (ancestors root newer).
+
+rpc root =
+  request = parse (need (Qnet.request Unit));
+  answer = if field "version" request != J.Integer 1 then refusal "unsupported protocol" else rpcOp root (text (field "op" request)) request;
+  need (Qnet.reply (encode answer)).
+rpcOp root "head" request = response [("head", J.Text (head root))].
+rpcOp root "fetch" request =
+  tip = head root;
+  response [("head", J.Text tip), ("objects", pack root tip)].
+rpcOp root "push" request =
+  before = head root;
+  expected = text (field "expected" request);
+  target = text (field "head" request);
+  if before != expected then refusal "stale push: fetch/pull before retrying" else
+    _ = check (validId target) "invalid push head";
+    _ = importPack root (field "objects" request);
+    _ = closure root target;
+    if not (isAncestor root before target) then refusal "non-fast-forward push refused" else
+      _ = put root "HEAD" target;
+      response [("head", J.Text target)].
+rpcOp root _ request = refusal "unknown operation".
+
+configureRemote root port =
+  _ = put root "remote.json" (encode (obj [("host", J.Text "127.0.0.1"), ("port", J.Integer port)]));
+  Unit.
+fetchRemote root =
+  answer = remoteCall (remotePort root) (obj [("version", J.Integer 1), ("op", J.Text "fetch")]);
+  tip = text (field "head" answer);
+  _ = check (tip == "" or validId tip) "invalid remote head";
+  _ = importPack root (field "objects" answer);
+  _ = closure root tip;
+  _ = put root "REMOTE_HEAD" tip;
+  tip.
+push root =
+  target = head root;
+  expected = S.trim (readPathOr "" (meta root "REMOTE_HEAD"));
+  _ = check (target != "") "no checkpoint to push";
+  _ = check (isAncestor root expected target) "local history diverged: pull before pushing";
+  answer = remoteCall (remotePort root) (obj [("version", J.Integer 1), ("op", J.Text "push"), ("head", J.Text target), ("expected", J.Text expected), ("objects", pack root target)]);
+  _ = check (field "head" answer == J.Text target) "unexpected push acknowledgement";
+  _ = put root "REMOTE_HEAD" target;
+  print "pushed {target}".
+
+# Checkout journal supports idempotent completion after an interrupted pull.
+currentId path = if exists path then J.Text (identity "blob" (readPath path)) else J.Null.
+applyPath root old new path =
+  current = currentId path;
+  before = field path old;
+  after = field path new;
+  _ = check (current == before or current == after) ("checkout interrupted by an edit to " + path);
+  if current == after then Unit else
+    if after == J.Null then need (Qfs.remove path) else
+      body = load root "blob" (text after);
+      _ = makeParents (S.split "/" path) "";
+      writePath path body.
+recoverCheckout root = if not (exists (meta root "checkout.json")) then Unit else
+  journal = parse (get root "checkout.json");
+  before = text (field "before" journal);
+  target = text (field "target" journal);
+  _ = check (head root == before or head root == target) "checkout journal does not match HEAD";
+  _ = closure root target;
+  old = snapshot root before;
+  new = snapshot root target;
+  _ = validateState old;
+  _ = validateState new;
+  _ = L.map (applyPath root old new) (changes old new);
+  _ = put root "HEAD" target;
+  need (Qfs.remove (meta root "checkout.json")).
+checkout root target =
+  before = head root;
+  old = snapshot root before;
+  new = snapshot root target;
+  _ = closure root target;
+  _ = check (L.isEmpty (changes old (tree (scan root)))) "dirty working copy: commit or restore before pulling";
+  _ = L.map (fn p -> check (currentId p == field p old) ("checkout would overwrite an untracked or ignored file: " + p)) (changes old new);
+  _ = put root "checkout.json" (encode (obj [("before", J.Text before), ("target", J.Text target)]));
+  recoverCheckout root.
+
+# Conservative three-way merge: individual file identities first, then JSON.
+mergeValue root path base left right =
+  if left == right then left else if base == left then right else if base == right then left else
+    case (base, left, right) of
+      (J.Text b, J.Text l, J.Text r) ->
+        candidate = case (J.parse (load root "blob" b), J.parse (load root "blob" l), J.parse (load root "blob" r)) of
+          (Ok bv, Ok lv, Ok rv) -> (case Merge.merge bv lv rv of Ok v -> v | Err why -> Program.fail 1 ("merge conflict at " + path + ": " + why))
+        | _ -> Program.fail 1 ("merge conflict at " + path + " (non-JSON content)");
+        body = encode candidate;
+        id = identity "blob" body;
+        _ = save root "blob" body id;
+        J.Text id
+    | _ -> Program.fail 1 ("merge conflict at " + path + " (delete/modify or concurrent add)").
+mergeStates root base left right = obj (L.filter (fn item -> case item of (_, v) -> v != J.Null)
+  (L.map (fn p -> (p, mergeValue root p (field p base) (field p left) (field p right))) (Set.toList (Set.fromList Ord.string (L.concat [keys base left, keys base right]))))).
+commonBase root left right =
+  common = Set.toList (Set.intersect (ancestors root left) (ancestors root right));
+  dominated = Set.fromList Ord.string (L.concatMap (fn id -> parents (record root id)) common);
+  nearest = L.filter (fn candidate -> not (Set.member candidate dominated)) common;
+  case nearest of [one] -> one | [] -> Program.fail 1 "unrelated histories" | _ -> Program.fail 1 "multiple merge bases: manual merge required".
+mergeHeads root left right =
+  base = commonBase root left right;
+  state = mergeStates root (snapshot root base) (snapshot root left) (snapshot root right);
+  _ = validateState state;
+  body = encode state;
+  sid = identity "tree" body;
+  rec = encode (obj [("root_state", J.Text sid), ("parents", J.Sequence [J.Text left, J.Text right]), ("author", J.Text "local"), ("timestamp", J.Integer (Clock.now Unit)), ("message", J.Text "Merge remote checkpoint"), ("metadata", obj [])]);
+  id = identity "commit" rec;
+  _ = save root "tree" body sid;
+  _ = save root "commit" rec id;
+  id.
+pull root =
+  local = head root;
+  _ = check (L.isEmpty (changes (snapshot root local) (tree (scan root)))) "dirty working copy: commit or restore before pulling";
+  remote = fetchRemote root;
+  if local == remote or isAncestor root remote local then print "up to date (local may be ahead)" else
+    target = if isAncestor root local remote then remote else mergeHeads root local remote;
+    _ = checkout root target;
+    print (if target == remote then "pulled {target}" else "merged remote into {target}; push to publish").
+commitMerge root message =
+  local = head root;
+  remote = S.trim (get root "REMOTE_HEAD");
+  _ = check (local != "" and remote != "" and not (isAncestor root remote local) and not (isAncestor root local remote)) "no divergent fetched remote to resolve";
+  _ = closure root remote;
+  commitWith root message [local, remote] True.
+cloneRepo root port =
+  _ = check (L.isEmpty (L.filter (fn name -> name != ".qrepo") (ls ""))) "clone requires an empty directory";
+  _ = init root;
+  _ = configureRemote root port;
+  pull root.
+
+usage u = Program.fail 2 "usage: qr init|status|commit MESSAGE|history|diff|tag NAME|show REV PATH|restore REV PATH [--force]|ignore PATH|merge-json BASE LEFT RIGHT|serve PORT|clone PORT|remote PORT|fetch|pull|push|commit-merge MESSAGE|recover".
+run : String -> List String -> Unit .
+run root ["init"] = init root.
+run root ["clone", port] = cloneRepo root (portOf port).
+run root args =
+  cfg = parse (get root "config.json");
+  _ = check (field "format" cfg == J.Integer 2) "unsupported QRepo format (native QRepo requires format 2)";
+  _ = recoverCheckout root;
+  dispatch root args.
+dispatch root ["merge-json", base, left, right] = print (J.render (need (Merge.merge (parse (readPath base)) (parse (readPath left)) (parse (readPath right))))).
+dispatch root ["__rpc"] = rpc root.
+dispatch root ["remote", port] = configureRemote root (portOf port).
+dispatch root ["fetch"] = print ("fetched " + fetchRemote root).
+dispatch root ["push"] = push root.
+dispatch root ["commit-merge", message] = commitMerge root message.
+dispatch root ["pull"] = pull root.
+dispatch root ["recover"] = recoverCheckout root.
+dispatch root ["status"] = status root.
+dispatch root ["commit", message] = commit root message.
+dispatch root ["history"] = history root (head root).
+dispatch root ["diff"] = _ = diff root; Unit.
+dispatch root ["tag", name] = tag root name.
+dispatch root ["show", rev, path] = need (Qfs.output (showFile root rev path)).
+dispatch root ["restore", rev, path] = restore root rev path False.
+dispatch root ["restore", rev, path, "--force"] = restore root rev path True.
+dispatch root ["ignore", rule] = ignore root rule.
+dispatch root _ = usage Unit.
+
+# Main holds the POSIX advisory repository lock until process exit.
+start root ["serve", port] =
+  _ = need (Qfs.begin root 0);
+  _ = check (field "format" (parse (get root "config.json")) == J.Integer 2) "unsupported repository format";
+  _ = Qfs.end Unit;
+  _ = need (Qnet.serve root (portOf port));
+  0.
+start root args =
+  initFlag = case args of ["init"] -> 1 | ["clone", _] -> 1 | _ -> 0;
+  _ = need (Qfs.begin root initFlag);
+  _ = run root args;
+  0.
+main = case Program.args Unit of
+    "--root" :: root :: args -> start root args
+  | "--help" :: [] -> _ = print "qr [--root DIRECTORY] init|status|commit MESSAGE|history|diff|tag NAME|show REV PATH|restore REV PATH [--force]|ignore PATH|merge-json BASE LEFT RIGHT|serve PORT|clone PORT|remote PORT|fetch|pull|push|commit-merge MESSAGE|recover"; 0
+  | [] -> Program.fail 2 "usage: qr [--root DIRECTORY] COMMAND ..."
+  | args -> start "." args.

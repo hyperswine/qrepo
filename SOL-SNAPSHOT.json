@@ -1,0 +1,16 @@
+{
+  "source": "qrepo before native port",
+  "preserved_at": "../qrepo-sol",
+  "date": "2026-09-28",
+  "sha256": {
+    "merge-cli.sol": "33f0205536f8969fc6bab82a40bebdf482e036cc93e29f80c938e4695b1f9bc8",
+    "qrepo-design.pdf": "58adfc807b9f91bcc2b9ef5aa9e4d24cea42a883edab6443cb132d6d7ead7d56",
+    "qr": "1b6f7fa63f2988733979a29839a86e68dce69f5ac39230b5454be751c02eec12",
+    "README.md": "f292e1a54f0a55d2430627eee159debb8fbadf93828ccf16d55ac975e20ea62b",
+    ".gitignore": "12e4ab21e6a20f396806cf44efc3421d0d9a0d2b9979145a3488b464d166fed8",
+    "qr.sol": "638cdc2652ac8c2d2ca80b76166643004c8c0606bedbc57a300711a79b4ba0c8",
+    "merge.sol": "574218dccf58b7f5b69145476fe979250c042e0cbea73744fcd223a4caf9b37f",
+    "tests/check.py": "77a14045e7b6c0c3b1588a4a59441d4543cd70ddb695077860bea3d797ea4deb",
+    "tests/merge.sol": "5566130251faabbcab671ff69a9a12fb5ec284a78f7e65ca954347f95bf77762"
+  }
+}

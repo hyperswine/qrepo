@@ -1,0 +1,19 @@
+unsafe base.
+M = use "../merge".
+J = use "std/json".
+check b msg = if b then Unit else error msg.
+need r = case r of Ok x -> x | Err e -> error e.
+conflict r = case r of Err _ -> True | _ -> False.
+base = J.object [("a", J.Integer 1), ("b", J.Integer 1)].
+left = J.object [("a", J.Integer 2), ("b", J.Integer 1)].
+right = J.object [("a", J.Integer 1), ("b", J.Integer 2)].
+main =
+  _ = check (J.equal (need (M.merge base left right)) (J.object [("a", J.Integer 2), ("b", J.Integer 2)])) "disjoint keys";
+  _ = check (conflict (M.merge base left (J.object [("a", J.Integer 3), ("b", J.Integer 1)]))) "overlap must conflict";
+  _ = check (conflict (M.merge base (J.object [("b", J.Integer 1)]) left)) "delete versus modify";
+  _ = check (J.equal (need (M.merge (J.object []) (J.object [("x", J.Null)]) (J.object []))) (J.object [("x", J.Null)])) "null is not absence";
+  _ = check (J.equal (need (M.merge base left left)) left) "identical changes";
+  _ = check (conflict (M.merge (J.Sequence []) (J.Sequence [J.Integer 1]) (J.Sequence [J.Integer 2]))) "arrays atomic";
+  _ = check (conflict (M.validated (fn value -> Err "schema refused") base left right)) "validator refusal";
+  _ = print "merge policies: PASS";
+  0.

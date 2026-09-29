@@ -1,0 +1,45 @@
+# Conservative three-way JSON policy. Arrays and scalars are atomic.
+# Missing keys are Options, distinct from a JSON null value.
+Set = use "std/set".
+J = use "std/json".
+M = use "std/map".
+O = use "std/option".
+L = use "std/list".
+Ord = use "std/order".
+same : O.Option J.Value -> O.Option J.Value -> Bool .
+same a b = case (a, b) of
+    (O.None, O.None) -> True
+  | (O.Some x, O.Some y) -> J.equal x y
+  | _ -> False.
+merge : J.Value -> J.Value -> J.Value -> Result J.Value String .
+merge base left right = case slot "$" (O.Some base) (O.Some left) (O.Some right) of
+    Ok (O.Some v) -> Ok v
+  | Ok O.None -> Err "root deleted"
+  | Err e -> Err e.
+slot : String -> O.Option J.Value -> O.Option J.Value -> O.Option J.Value -> Result (O.Option J.Value) String .
+slot path base left right =
+  if same left right then Ok left else
+  if same base left then Ok right else
+  if same base right then Ok left else
+    case (base, left, right) of
+      (O.Some (J.Object b), O.Some (J.Object l), O.Some (J.Object r)) -> mergeObjects path b l r
+    | (O.None, O.Some (J.Object l), O.Some (J.Object r)) -> mergeObjects path M.strings l r
+    | _ -> Err ("conflict at " + path).
+mergeObjects : String -> M.Map String J.Value -> M.Map String J.Value -> M.Map String J.Value -> Result (O.Option J.Value) String .
+mergeObjects path b l r =
+  ks = Set.toList (Set.fromList Ord.string (L.concat [M.keys b, M.keys l, M.keys r]));
+  case mergeKeys path b l r ks [] of
+    Ok entries -> Ok (O.Some (J.object entries))
+  | Err e -> Err e.
+mergeKeys : String -> M.Map String J.Value -> M.Map String J.Value -> M.Map String J.Value -> List String -> List (String, J.Value) -> Result (List (String, J.Value)) String .
+mergeKeys path b l r ks acc = case ks of
+    [] -> Ok acc
+  | k :: rest -> (case slot (path + "/" + k) (M.get k b) (M.get k l) (M.get k r) of
+      Err e -> Err e
+    | Ok O.None -> mergeKeys path b l r rest acc
+    | Ok (O.Some v) -> mergeKeys path b l r rest ((k, v) :: acc)).
+# Validator supplied by the project: candidate -> Result Unit String.
+validated : (J.Value -> Result Unit String) -> J.Value -> J.Value -> J.Value -> Result J.Value String .
+validated validator base left right = case merge base left right of
+    Err e -> Err e
+  | Ok candidate -> (case validator candidate of Err e -> Err ("validation failed: " + e) | Ok _ -> Ok candidate).
