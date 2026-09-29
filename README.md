@@ -8,7 +8,8 @@ There is no Internet hosting, automatic commit, or named branch management.
 
 ## Build and use
 
-Requires the FP-RISC compiler and a C toolchain. `build.sh` uses `$FPR`, then
+Requires the FP-RISC compiler (with `Proc.self` and exact JSON integers:
+fprisc after 2026-09-29) and a C toolchain. `build.sh` uses `$FPR`, then
 `../fprisc/fpr`, then `fpr` on PATH. macOS uses CommonCrypto; Linux/FreeBSD need
 OpenSSL development headers/libraries (`libcrypto`). Only macOS arm64 has been
 executed and tested so far.
@@ -36,16 +37,28 @@ Ignore rules are literal root-relative file paths or directory prefixes ending
 in `/`, not globs. Ignored directories are pruned before descent. `.qrepo` is
 always excluded; `.qrepoignore` is ordinary versioned content.
 
+What QRepo does not version is **skipped and said**, not fatal: `status` lists
+each symlink, device, FIFO and nested repository's `.qrepo` as
+`skipped (not versioned): PATH`, and commits go ahead without them. A link is
+never followed. Two kinds of name are reserved in every path component and
+refused in any tree, local or remote: `.qrepo` under any casing, and
+`.qr-tmp-*`, which publication gives its temporary files.
+
 ## Implementation boundary
 
 - `qr.fpr`: command dispatch, snapshots, SHA-256 object identities, integrity
   checks, history, tags, ignores, guarded restores, and differences.
 - `merge.fpr`: recursive JSON three-way merge and a caller-supplied validator.
   Arrays/scalars are atomic. Missing keys and JSON null are distinct.
-- `network.c`: loopback TCP framing and isolated native request workers.
-- `posix.c`: a host adapter for descriptor-relative filesystem operations,
-  process locking, durable file publication, exact byte output, and host SHA-256.
-  It does not implement repository/merge policy or invoke subprocesses.
+- The remote is FP-RISC too: framing, the listener and the request workers are
+  in `qr.fpr` over `std/tcp`, `std/stream` and `std/proc`. There is no network
+  adapter in C (there was, `network.c`, until 2026-09-29).
+- `posix.c`: a host adapter for what Base does not have yet: descriptor-relative
+  no-follow filesystem access, process locking, durable file publication,
+  exact byte output, and host SHA-256 (`std/digest` is correct and about 1,600
+  times slower). It refuses, by device and inode, any path that resolves into
+  the metadata directory under another spelling. It does not implement
+  repository/merge policy or invoke subprocesses.
 - `qr`: a compiled executable. It does not invoke Sol, Python, or the compiler.
   Python is used only by tests/benchmarks and the experiment driver.
 
@@ -90,8 +103,10 @@ refs use atomic replacement, never in-place truncation. All referenced objects
 are published before `HEAD`. Initialization publishes `config.json` last.
 
 An interrupted commit can leave unreachable objects or `.qr-tmp-*` files, but
-`HEAD` refers to a complete old or new checkpoint. There is no garbage collector
-yet. A synchronization error after publication can report failure even though
+`HEAD` refers to a complete old or new checkpoint. A temporary file left in the
+working tree is removed by the next command that scans, which holds the lock
+its writer no longer does; it is never versioned. There is no garbage collector
+for objects yet. A synchronization error after publication can report failure even though
 the new ref is visible; inspect history before retrying. `fsync` durability is
 subject to the OS, filesystem, and device, and physical power-loss behavior has
 not been tested. Remote/network filesystem semantics have not been validated.
@@ -109,6 +124,11 @@ quiescent workspace when an exact cross-file snapshot is required.
 ./test.sh
 python3 tests/bench.py
 ```
+
+`tests/fixes.py` holds one regression per fault found in the review of
+2026-09-29: writes into `.qrepo` through another spelling, integers changed by
+a JSON merge, scans stopped by a symlink, transfers past 16 MiB, temporary
+files versioned, and directories and files trading places.
 
 The tests use disposable repositories. They cover Unicode and binary bytes,
 SHA-256 identity/deduplication, ancestry, immutable tags, status/diff, exact

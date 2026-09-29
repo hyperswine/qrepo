@@ -9,6 +9,17 @@
 #include <stdio.h>
 static int rootfd = -1, lockfd = -1;
 static unsigned long serial;
+/* The metadata directory, by IDENTITY.  A name is not enough: on a
+ * case-insensitive volume ".QREPO" opens .qrepo, and a file system may fold
+ * Unicode forms or ignore characters besides.  So whatever a path's
+ * components are called, none of them may BE this directory unless the path
+ * is literally under ".qrepo".  (A tree from a remote that named
+ * ".QREPO/checkout.json" used to write into the repository's own metadata.) */
+static dev_t metadev;
+static ino_t metaino;
+static const char *refusal; /* why parent() refused, when errno does not say */
+static int is_meta(int fd) { struct stat st; return !fstat(fd, &st) && st.st_dev == metadev && st.st_ino == metaino; }
+static V failed(void) { if (refusal) { const char *why = refusal; refusal = NULL; return os_err(why); } return os_errno(); }
 /* Fault injection exists only in a separately built test executable. */
 static void fault(const char *stage, V path) {
 #ifdef QREPO_TEST_FAULTS
@@ -44,12 +55,21 @@ static int parent(V v, char **leaf) {
   if (!*s || *s == '/' || s[strlen(s)-1] == '/') { free(s); errno = EINVAL; return -1; }
   int fd = dup(rootfd); if (fd < 0) { free(s); return -1; }
   char *p = s;
-  for (;;) {
+  refusal = NULL;
+  for (int depth = 0;; depth++) {
     char *slash = strchr(p, '/'); if (slash) *slash = 0;
     if (!*p || !strcmp(p,".") || !strcmp(p,"..")) { close(fd); free(s); errno=EINVAL; return -1; }
-    if (!slash) { *leaf = strdup(p); free(s); if (!*leaf) { close(fd); errno=ENOMEM; return -1; } return fd; }
+    if (!slash) {
+      /* the leaf may be the metadata directory only by its own name */
+      struct stat st;
+      if (strcmp(p, ".qrepo") && !fstatat(fd, p, &st, AT_SYMLINK_NOFOLLOW) && st.st_dev == metadev && st.st_ino == metaino) {
+        close(fd); free(s); errno = EPERM; refusal = "path names the repository metadata under another spelling"; return -1; }
+      *leaf = strdup(p); free(s); if (!*leaf) { close(fd); errno=ENOMEM; return -1; } return fd; }
     int next = openat(fd,p,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
-    int e=errno; close(fd); if(next<0){free(s);errno=e;return -1;} fd=next; p=slash+1;
+    int e=errno; close(fd); if(next<0){free(s);errno=e;return -1;}
+    if (is_meta(next) && (depth != 0 || strcmp(p, ".qrepo"))) {
+      close(next); free(s); errno = EPERM; refusal = "path resolves into the repository metadata under another spelling"; return -1; }
+    fd=next; p=slash+1;
   }
 }
 static V begin(V rv, V initv) {
@@ -63,20 +83,23 @@ static V begin(V rv, V initv) {
   if(lockfd<0){close(meta);return os_errno();}
   struct stat st;
   if(fstat(lockfd,&st)<0 || !S_ISREG(st.st_mode) || st.st_nlink!=1){close(meta);return os_err("invalid repository lock");}
+  struct stat ms; if(fstat(meta,&ms)<0){close(meta);return os_errno();} metadev=ms.st_dev; metaino=ms.st_ino;
   if(flock(lockfd,LOCK_EX)<0){close(meta);return os_errno();}
   if(UNTAG(initv) && (fsync(meta)<0 || fsync(rootfd)<0)){close(meta);return os_errno();}
   close(meta);return os_ok((V)&fpr_unit);
 }
 FPR_FN_CSTACK(fpr_g_Qfs_x2ebegin,begin,2);
 static V kind(V pv){
-  char *name=NULL;int fd=parent(pv,&name); if(fd<0)return errno==ENOENT?os_ok(TAG(-1)):os_errno();
+  char *name=NULL;int fd=parent(pv,&name);
+  /* no such ancestor, or an ancestor that is a file: the path does not exist */
+  if(fd<0)return (!refusal && (errno==ENOENT||errno==ENOTDIR))?os_ok(TAG(-1)):failed();
   struct stat st;int r=fstatat(fd,name,&st,AT_SYMLINK_NOFOLLOW);int e=errno;free(name);close(fd);
   if(r<0){if(e==ENOENT)return os_ok(TAG(-1));errno=e;return os_errno();}
   return os_ok(TAG(S_ISREG(st.st_mode)?0:S_ISDIR(st.st_mode)?1:2));
 }
 FPR_FN_CSTACK(fpr_g_Qfs_x2ekind,kind,1);
 static V readfile(V pv){
-  char *name=NULL;int dir=parent(pv,&name);if(dir<0)return os_errno();
+  char *name=NULL;int dir=parent(pv,&name);if(dir<0)return failed();
   int fd=openat(dir,name,O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);int e=errno;free(name);close(dir);
   if(fd<0){errno=e;return os_errno();}
   struct stat before,after;if(fstat(fd,&before)<0 || !S_ISREG(before.st_mode)){close(fd);return os_err("not a regular file");}
@@ -98,7 +121,7 @@ static int cmp(const void*a,const void*b){return strcmp(*(char*const*)a,*(char*c
 static V list(V pv){
   int fd;
   if(((str_t*)pv)->len==0)fd=openat(rootfd,".",O_RDONLY|O_DIRECTORY|O_CLOEXEC);
-  else{char*name=NULL;int dir=parent(pv,&name);if(dir<0)return os_errno();fd=openat(dir,name,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);int e=errno;free(name);close(dir);errno=e;}
+  else{char*name=NULL;int dir=parent(pv,&name);if(dir<0)return failed();fd=openat(dir,name,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);int e=errno;free(name);close(dir);errno=e;}
   if(fd<0)return os_errno();DIR*d=fdopendir(fd);if(!d){close(fd);return os_errno();}
   char **names=NULL;size_t n=0,cap=0;int err=0;
   for(;;){errno=0;struct dirent*de=readdir(d);if(!de){err=errno;break;}if(!strcmp(de->d_name,".")||!strcmp(de->d_name,".."))continue;
@@ -110,14 +133,14 @@ static V list(V pv){
   if(err){errno=err;return os_errno();}return os_ok(out);
 }
 FPR_FN_CSTACK(fpr_g_Qfs_x2elist,list,1);
-static V makedir(V pv){char*name=NULL;int fd=parent(pv,&name);if(fd<0)return os_errno();
+static V makedir(V pv){char*name=NULL;int fd=parent(pv,&name);if(fd<0)return failed();
   int r=mkdirat(fd,name,0700);if(r<0&&errno==EEXIST){int d=openat(fd,name,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);if(d>=0){close(d);r=0;}}
   if(!r)r=fsync(fd);V out=os_unit_or_errno(r);free(name);close(fd);return out;}
 FPR_FN_CSTACK(fpr_g_Qfs_x2emkdir,makedir,1);
 /* mode 1 creates an immutable object exclusively; mode 0 replaces a ref.
  * Write + fsync temp, publish, then fsync parent. Never truncate the target. */
 static V writefile(V pv,V bv,V mv){
-  char*name=NULL;int dir=parent(pv,&name);if(dir<0)return os_errno();
+  char*name=NULL;int dir=parent(pv,&name);if(dir<0)return failed();
   struct stat st;int sr=fstatat(dir,name,&st,AT_SYMLINK_NOFOLLOW);
   if(sr==0&&!S_ISREG(st.st_mode)){free(name);close(dir);return os_err("not a regular file");}
   if(sr<0&&errno!=ENOENT){V out=os_errno();free(name);close(dir);return out;}
@@ -162,12 +185,20 @@ static V output(V bv){str_t*b=(str_t*)bv;size_t at=0;while(at<b->len){ssize_t n=
 FPR_FN_CSTACK(fpr_g_Qfs_x2eoutput,output,1);
 
 /* Remove a regular working file or completed checkout journal durably. */
-static V removefile(V pv){char *name=NULL;int fd=parent(pv,&name);if(fd<0)return os_errno();
+static V removefile(V pv){char *name=NULL;int fd=parent(pv,&name);if(fd<0)return failed();
   struct stat st;int r=fstatat(fd,name,&st,AT_SYMLINK_NOFOLLOW);
   if(r==0&&!S_ISREG(st.st_mode)){free(name);close(fd);return os_err("not a regular file");}
   if(r==0)r=unlinkat(fd,name,0);if(r==0)r=fsync(fd);V out=os_unit_or_errno(r);free(name);close(fd);return out;
 }
 FPR_FN_CSTACK(fpr_g_Qfs_x2eremove,removefile,1);
+
+/* Remove an EMPTY directory (a checkout that deleted its last file, or that
+ * puts a file where a directory stood).  A directory that holds anything is
+ * refused by the host, which is the point. */
+static V removedir(V pv){char *name=NULL;int fd=parent(pv,&name);if(fd<0)return failed();
+  int r=unlinkat(fd,name,AT_REMOVEDIR);if(r==0)r=fsync(fd);V out=os_unit_or_errno(r);free(name);close(fd);return out;
+}
+FPR_FN_CSTACK(fpr_g_Qfs_x2ermdir,removedir,1);
 
 static V endrepo(V unit){(void)unit;if(lockfd>=0){close(lockfd);lockfd=-1;}if(rootfd>=0){close(rootfd);rootfd=-1;}return (V)&fpr_unit;}
 FPR_FN_CSTACK(fpr_g_Qfs_x2eend,endrepo,1);
