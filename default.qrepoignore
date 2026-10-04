@@ -1,0 +1,25 @@
+# Not versioned here.  One pattern a line: a bare name matches at any depth,
+# with * and ? as wildcards; a pattern with a / is anchored at the root; NAME/
+# is a directory.  This file is versioned like any other: edit it freely.
+# macOS
+.DS_Store
+._*
+.Spotlight-V100/
+.Trashes/
+.fseventsd/
+.TemporaryItems/
+# Office and LibreOffice, while a document is open
+~$*
+.~lock.*#
+# editors' swap and backup files
+*.swp
+*.swo
+*~
+.#*
+# Windows
+Thumbs.db
+desktop.ini
+# downloads still in progress
+*.crdownload
+*.part
+*.download/

@@ -2,7 +2,7 @@
   "name": "qrepo",
   "displayName": "QRepo",
   "description": "Syncs a qrepo workspace on its own, holds unusual changes, settles conflicts with you, and shows where each line came from.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "jasen",
   "license": "UNLICENSED",
   "repository": { "type": "git", "url": "https://github.com/hyperswine/qrepo" },
@@ -26,11 +26,11 @@
     "configuration": {
       "title": "QRepo",
       "properties": {
-        "qrepo.path": { "type": "string", "default": "", "description": "The qr executable. Empty: `qr` on PATH." },
+        "qrepo.path": { "type": "string", "default": "", "scope": "machine", "description": "The qr executable. Empty: `qr` on PATH. A machine setting: a folder's own settings cannot choose what runs." },
         "qrepo.autoSync": { "type": "boolean", "default": true, "description": "Sync on a timer and after saves. Off: only `qrepo: Sync now`." },
         "qrepo.syncInterval": { "type": "number", "default": 60, "minimum": 5, "description": "Seconds between syncs." },
         "qrepo.idleDelay": { "type": "number", "default": 10, "minimum": 1, "description": "Seconds after a save before syncing." },
-        "qrepo.device": { "type": "string", "default": "", "description": "This device's name in history and hovers (qr config device). Empty: leave as it is." },
+        "qrepo.device": { "type": "string", "default": "", "scope": "machine", "description": "This device's name in history and hovers (qr config device). Empty: leave as it is. A machine setting." },
         "qrepo.mergeRules": { "type": "boolean", "default": false, "description": "Merge edits that only touch (adjacent lines, both appending) instead of asking; both devices' lines are kept, the other device's first. Sets qr config merge-rules for this folder." },
         "qrepo.hover": { "type": "boolean", "default": true, "description": "Show on hover which device and checkpoint wrote a line." },
         "qrepo.hold.deletions": { "type": "boolean", "default": true, "description": "Hold a deleted file for a look before syncing it." },

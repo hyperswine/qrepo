@@ -223,7 +223,7 @@ with tempfile.TemporaryDirectory(prefix='qrepo-fixes-') as d:
     tree = json.loads((root / '.qrepo/objects' / json.loads(
         (root / '.qrepo/objects' / head(root)).read_bytes().split(
             b'\n', 1)[1])['root_state']).read_bytes().split(b'\n', 1)[1])
-    assert sorted(tree) == ['a.txt', 'vendor/lib/code.txt'], tree
+    assert sorted(tree) == ['.qrepoignore', 'a.txt', 'vendor/lib/code.txt'], tree
     out = cmd(root, 'status')
     for name in ['link', 'dangling', 'pipe', 'vendor/lib/.qrepo']:
         assert 'skipped (not versioned): ' + name + ' ' in out, (name, out)

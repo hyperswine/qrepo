@@ -80,6 +80,21 @@ the other side never has. `blame` of that 5,000-line file over 200 commits,
 each changing it: 1.1 s, 153 MB (each step's diff in an arena; the line
 numbers carried down grow with lines times depth).
 
+## History at scale, 2026-10-04
+
+500 files, 1,500 commits each changing one, served over loopback HTTP; the
+build before generation numbers and verified marks against the one after:
+
+| | Before | After |
+|---|---:|---:|
+| `sync`, nothing new (the editor's every-minute tick) | 7.0 s | 0.06 s |
+| `sync`, pulling one new commit | 13.0 s | 0.23 s |
+| `sync`, merging and pushing | 21.7 s | 0.39 s |
+| first clone (checks all of history once) | 15.5 s | 7.5 s |
+
+Before, each of these walked every ancestor and parsed every commit's tree,
+on both sides; the cost grew with commits times files.
+
 ## Remaining costs
 
 - Scans read/hash the complete included working tree every time.
@@ -89,9 +104,9 @@ numbers carried down grow with lines times depth).
   paths are unmeasured.
 - Each new object is synchronized individually, favoring publication integrity
   over maximum commit throughput.
-- History is walked whole (each commit's tree is parsed once per walk); no
-  pagination or history index. Old versions are kept for as long as a commit
-  names them: `gc` removes only what nothing reaches.
+- `history` and `blame` still walk back as far as they must (blame, to where
+  each line began, parsing a tree per commit). Old versions are kept for as
+  long as a commit names them: `gc` removes only what nothing reaches.
 - Objects live in a flat directory, without packing or sharding.
 - Diff displays complete contents and can produce large output.
 - Linux/FreeBSD portability is source-level only; those hosts have not been run.

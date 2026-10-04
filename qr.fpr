@@ -249,13 +249,20 @@ statusJson root =
     ("skipped", J.Sequence (L.map J.Text (skips seen)))])).
 
 init : String -> Unit .
+# A new repository starts with default.qrepoignore (in this source tree) as
+# its .qrepoignore, unless it has one.  A clone does not: its .qrepoignore is
+# the remote's, and one written first would stand in the checkout's way.
+defaultIgnore = "# Not versioned here.  One pattern a line: a bare name matches at any depth,\n# with * and ? as wildcards; a pattern with a / is anchored at the root; NAME/\n# is a directory.  This file is versioned like any other: edit it freely.\n# macOS\n.DS_Store\n._*\n.Spotlight-V100/\n.Trashes/\n.fseventsd/\n.TemporaryItems/\n# Office and LibreOffice, while a document is open\n~$*\n.~lock.*#\n# editors' swap and backup files\n*.swp\n*.swo\n*~\n.#*\n# Windows\nThumbs.db\ndesktop.ini\n# downloads still in progress\n*.crdownload\n*.part\n*.download/\n".
 init root =
+  _ = initStore root;
+  _ = (if exists ".qrepoignore" then Unit else writePath ".qrepoignore" defaultIgnore);
+  print "initialized native local QRepo (format 2)".
+initStore root =
   _ = check (not (exists (meta root "config.json"))) "already initialized";
   _ = mkdirp (meta root "objects");
   _ = put root "HEAD" "";
   _ = put root "tags.json" (encode (obj []));
-  _ = put root "config.json" (encode (obj [("format", J.Integer 2), ("mode", J.Text "local-only")]));
-  print "initialized native local QRepo (format 2)".
+  put root "config.json" (encode (obj [("format", J.Integer 2), ("mode", J.Text "local-only")])).
 
 # ---- This device's settings: .qrepo/config.json, never synced --------------------
 # device       the name its commits carry as their author ("local" until set)
@@ -293,6 +300,7 @@ makeCommit root message commitParents allowSame =
   _ = each (fn item -> case item of (p, key) -> storeFile root p key) files;
   _ = save root "tree" body stateId;
   _ = save root "commit" recBody id;
+  _ = markMade root id commitParents;
   _ = put root "HEAD" id;
   id.
 
@@ -448,7 +456,6 @@ checkPrefixes parts prefix state = case parts of
 # each of which hashes what it publishes -- and when a checkout writes it out;
 # here it need only be present and a blob.  `deep` hashes every blob again
 # (gc, before it removes anything).
-closure root tip = graph root False (if tip == "" then [] else [tip]) Set.strings Set.strings.
 graph root deep todo seen objects = case todo of
     [] -> Set.toList objects
   | id :: rest -> if Set.member id seen then graph root deep rest seen objects else
@@ -465,24 +472,22 @@ commitStep root deep id objects =
   fresh = L.filter (fn bid -> not (Set.member bid objects)) (L.map (fn item -> case item of (_, v) -> text v) (pairs state));
   _ = each (fn bid -> if deep then verifyObject root "blob" bid else presentObject root "blob" bid) fresh;
   (ps, treeId, fresh).
-# What a store holds that is reachable from these commits: commits and trees
-# are read, blobs are only named.  An id this store does not have, or that is
-# not a commit, reaches nothing.
+# an id this store holds as a commit
 isCommit root id = validId id and exists (meta root ("objects/" + id)) and S.startsWith "commit\n" (get root ("objects/" + id)).
-reach root tips = reachGo root tips Set.strings.
-reachGo root todo seen = case todo of
-    [] -> seen
-  | id :: rest -> if Set.member id seen or not (isCommit root id) then reachGo root rest seen else
-      (ps, more) = Sys.arena (fn u ->
-        rec = record root id;
-        treeId = text (field "root_state" rec);
-        blobIds = L.map (fn item -> case item of (_, v) -> text v) (pairs (parse (load root "tree" treeId)));
-        (parents rec, treeId :: L.filter (fn b -> not (Set.member b seen)) blobIds));
-      reachGo root (L.append ps rest) (Set.insertAll (id :: more) seen).
-# the objects of `tip` that someone holding `haves` lacks
-pack root tip haves =
-  known = reach root haves;
-  L.filter (fn id -> not (Set.member id known)) (closure root tip).
+# the objects of `tip` that someone holding `haves` lacks: the commits only
+# `tip` reaches (newCommits), their trees, and their blobs, less the blobs the
+# haves' own trees hold.  A blob some older commit of theirs had, and the
+# haves do not, is sent again; the receiver keeps one copy.
+pack root tip haves = if tip == "" then [] else
+  known = isCommit root;
+  hs = L.filter known haves;
+  fresh = newCommits root tip hs;
+  held = Set.fromList Ord.string (L.concat (L.map (fn h -> Sys.arena (fn u -> treeObjects root h)) hs));
+  L.filter (fn id -> not (Set.member id held)) (Set.toList (Set.fromList Ord.string
+    (L.concat (L.map (fn c -> c :: Sys.arena (fn u -> treeObjects root c)) fresh)))).
+# a commit's tree and the blobs it names
+treeObjects root c = rec = record root c; treeId = text (field "root_state" rec);
+  treeId :: L.map (fn item -> case item of (_, v) -> text v) (pairs (parse (load root "tree" treeId))).
 # objects from a message file, each checked by kind and hashed in place
 importSpans root path objects = each (fn sp -> case sp of (off, n) -> importSpan root path off n) objects.
 importSpan root path off n =
@@ -493,11 +498,107 @@ importSpan root path off n =
   if exists dst then check (need (Qfs.hash dst 0 -1 "") == id) "immutable object corruption"
   else need (Qfs.store path off n "" dst id).
 ids value = case value of J.Sequence xs -> L.filter validId (L.concat (L.map (fn x -> case x of J.Text t -> [t] | _ -> []) xs)) | _ -> [].
-ancestors root tip = ancestorsGo root (if tip == "" then [] else [tip]) Set.strings.
-ancestorsGo root todo seen = case todo of
-    [] -> seen
-  | id :: rest -> if Set.member id seen then ancestorsGo root rest seen else ancestorsGo root (L.append (parents (record root id)) rest) (Set.insert id seen).
-isAncestor root older newer = older == "" or Set.member older (ancestors root newer).
+# ---- History at scale ------------------------------------------------------------
+# Walking all of history on every sync grows with commits times files; an
+# editor syncs every minute.  Two local caches, as git keeps them, bound it:
+#
+# .qrepo/graph: a GENERATION per commit, 1 + the highest of its parents' (1
+#   for a root), with its parents.  A commit can be an ancestor only of
+#   commits of a higher generation, so a search for one stops below its
+#   generation.  Each line is "id gen parents check", check being 16 hex of
+#   the SHA-256 of the rest: a torn or altered line fails it and is computed
+#   again, never believed.  Lines are appended as commits are first seen.
+# .qrepo/verified: commits whose whole history was found complete.  Their
+#   history is never checked again, so a fetch, push or checkout checks what
+#   is new.  gc (which checks everything, deeply) rewrites both.
+#
+# Neither is part of the format: deleted, they are rebuilt.
+cacheLine fields = body = S.join " " fields; body + " " + substr (sha body) 0 16 + "\n".
+cacheEntries root name = L.concat (L.map (fn line ->
+  case S.split " " line of
+      [] -> []
+    | parts -> (case L.reverse parts of
+          check :: rev -> body = S.join " " (L.reverse rev); if L.length parts >= 2 and substr (sha body) 0 16 == check then [L.reverse rev] else []
+        | [] -> [])) (S.split "\n" (readPathOr "" (meta root name)))).
+loadGraph root = M.fromList Ord.string (L.concat (L.map (fn f -> case f of
+    [id, gen, ps] -> (case S.toInt gen of Ok n -> [(id, (n, L.filter (fn x -> x != "") (S.split "," ps)))] | Err _ -> [])
+  | _ -> []) (cacheEntries root "graph"))).
+# the graph, with entries for these commits and all their ancestors
+withGens root g tips =
+  (g2, lines) = gensGo root tips g [];
+  _ = (if L.isEmpty lines then Unit else need (Qfs.append (meta root "graph") (strJoin "" (L.reverse lines))));
+  g2.
+gensGo root stack g lines = case stack of
+    [] -> (g, lines)
+  | id :: rest -> if M.member id g then gensGo root rest g lines else
+      ps = parents (record root id);
+      (case L.filter (fn x -> not (M.member x g)) ps of
+          [] -> gen = 1 + L.fold (fn m x -> case M.get x g of O.Some (n, _) -> (if n > m then n else m) | O.None -> m) 0 ps;
+                gensGo root rest (M.insert id (gen, ps) g) (cacheLine [id, "{gen}", S.join "," ps] :: lines)
+        | missing -> gensGo root (L.append missing stack) g lines).
+genIn g id = case M.get id g of O.Some (n, _) -> n | O.None -> 0.
+parentsIn g id = case M.get id g of O.Some (_, ps) -> ps | O.None -> [].
+
+isAncestor root older newer = if older == "" or older == newer then True else if newer == "" then False else
+  g = withGens root (loadGraph root) [older, newer];
+  floor = genIn g older;
+  reachDown g older floor [newer] Set.strings.
+reachDown g target floor todo seen = case todo of
+    [] -> False
+  | id :: rest -> if id == target then True else
+      if Set.member id seen or genIn g id <= floor then reachDown g target floor rest seen
+      else reachDown g target floor (L.append (parentsIn g id) rest) (Set.insert id seen).
+
+# Two walks at once, newest generation first, each commit carrying flags for
+# which side reaches it.  A queue is a list kept in descending generation.
+enqueue g q id flags = case q of
+    [] -> [(genIn g id, id, flags)]
+  | (n, x, f) :: rest -> if x == id then (n, x, bor f flags) :: rest
+      else if genIn g id > n or (genIn g id == n and strCmp id x < 0) then (genIn g id, id, flags) :: q
+      else (n, x, f) :: enqueue g rest id flags.
+# the commits `tip` reaches that no `have` does
+newCommits root tip haves =
+  g = withGens root (loadGraph root) (tip :: haves);
+  start = L.fold (fn q h -> enqueue g q h 2) (enqueue g [] tip 1) haves;
+  newGo g start [].
+newGo g q acc = if L.all (fn e -> case e of (_, _, f) -> f == 2) q then acc else
+  (case q of
+      [] -> acc
+    | (_, id, f) :: rest ->
+        q2 = L.fold (fn qq x -> enqueue g qq x f) rest (parentsIn g id);
+        newGo g q2 (if f == 1 then id :: acc else acc)).
+# the nearest commits both reach, none an ancestor of another; as git finds them
+mergeBases root left right =
+  g = withGens root (loadGraph root) [left, right];
+  found = basesGo g (enqueue g (enqueue g [] left 1) right 2) [];
+  L.filter (fn c -> not (L.any (fn d -> d != c and isAncestor root c d) found)) found.
+basesGo g q acc = if L.all (fn e -> case e of (_, _, f) -> band f 4 != 0) q then acc else
+  (case q of
+      [] -> acc
+    | (_, id, f) :: rest ->
+        both = band f 3 == 3 and band f 4 == 0;
+        f2 = if both then bor f 4 else f;
+        basesGo g (L.fold (fn qq x -> enqueue g qq x f2) rest (parentsIn g id)) (if both then id :: acc else acc)).
+
+# A commit made here, every file of it just stored, whose parents are all
+# verified (or that has none) is complete as it stands: mark it so.
+markMade root id ps = if L.all (fn p -> Set.member p (loadMarks root)) ps then need (Qfs.append (meta root "verified") (cacheLine [id])) else Unit.
+loadMarks root = Set.fromList Ord.string (L.concat (L.map (fn f -> case f of [id] -> [id] | _ -> []) (cacheEntries root "verified"))).
+# that a commit's whole history is here and sound, checking only what no
+# verified commit already covers
+verified root tip = if tip == "" then Unit else
+  marks = loadMarks root;
+  if Set.member tip marks then Unit else
+    _ = verifyWalk root [tip] marks Set.strings Set.strings;
+    need (Qfs.append (meta root "verified") (cacheLine [tip])).
+verifyWalk root todo marks seen objects = case todo of
+    [] -> Unit
+  | id :: rest -> if Set.member id seen or Set.member id marks then verifyWalk root rest marks (Set.insert id seen) objects else
+      # what verified parents hold needs no check again
+      known = L.concat (L.map (fn p -> if Set.member p marks then Sys.arena (fn u -> treeObjects root p) else []) (parents (record root id)));
+      objects2 = Set.insertAll known objects;
+      (ps, treeId, fresh) = Sys.arena (fn u -> commitStep root False id objects2);
+      verifyWalk root (L.append ps rest) marks (Set.insert id seen) (Set.insertAll (id :: treeId :: fresh) objects2).
 
 # The worker: ONE request from a spool file, its reply into another, then
 # exit.  The listener runs a fresh one per request, so a request that fails --
@@ -519,7 +620,7 @@ rpcOp root "push" request inPath objects =
   if before != expected then (refusal "stale push: fetch/pull before retrying", []) else
     _ = check (validId target) "invalid push head";
     _ = importSpans root inPath objects;
-    _ = closure root target;
+    _ = verified root target;
     if not (isAncestor root before target) then (refusal "non-fast-forward push refused", []) else
       _ = put root "HEAD" target;
       (response [("head", J.Text target)], []).
@@ -697,7 +798,7 @@ fetchRemote root =
   _ = check (tip == "" or validId tip) "invalid remote head";
   _ = importSpans root resp objects;
   _ = removeIf resp;
-  _ = closure root tip;
+  _ = verified root tip;
   _ = put root "REMOTE_HEAD" tip;
   tip.
 push root = case pushTry root of
@@ -764,7 +865,7 @@ recoverCheckout root = if not (exists (meta root "checkout.json")) then Unit els
   before = text (field "before" journal);
   target = text (field "target" journal);
   _ = check (head root == before or head root == target) "checkout journal does not match HEAD";
-  _ = closure root target;
+  _ = verified root target;
   old = snapshot root before;
   new = snapshot root target;
   _ = validateState old;
@@ -778,7 +879,7 @@ checkout root target =
   before = head root;
   old = snapshot root before;
   new = snapshot root target;
-  _ = closure root target;
+  _ = verified root target;
   _ = check (L.isEmpty (changes old (tree (scan root)))) "dirty working copy: commit or restore before pulling";
   _ = each (guard root old new) (changes old new);
   _ = put root "checkout.json" (encode (obj [("before", J.Text before), ("target", J.Text target)]));
@@ -817,11 +918,10 @@ mergeStates root rules oursFirst base left right =
   conflicts = L.concat (L.map (fn item -> case item of (_, Err c) -> [c] | _ -> []) results);
   kept = L.concat (L.map (fn item -> case item of (p, Ok v) -> (if v == J.Null then [] else [(p, v)]) | _ -> []) results);
   (obj kept, conflicts).
-commonBase root left right =
-  common = Set.toList (Set.intersect (ancestors root left) (ancestors root right));
-  dominated = Set.fromList Ord.string (L.concatMap (fn id -> parents (record root id)) common);
-  nearest = L.filter (fn candidate -> not (Set.member candidate dominated)) common;
-  case nearest of [one] -> one | [] -> Program.fail 1 "unrelated histories" | _ -> Program.fail 1 "multiple merge bases: manual merge required".
+commonBase root left right = case mergeBases root left right of
+    [one] -> one
+  | [] -> Program.fail 1 "unrelated histories"
+  | _ -> Program.fail 1 "multiple merge bases: manual merge required".
 # the merged commit, or every file that conflicts.  With the rules on, lines
 # both sides inserted at one place go the remote's first: they reached the
 # server first.  (Not by commit time: devices' clocks differ, and seconds tie.)
@@ -836,6 +936,7 @@ mergeHeads root left right =
     id = identity "commit" rec;
     _ = save root "tree" body sid;
     _ = save root "commit" rec id;
+    _ = markMade root id [left, right];
     Ok id.
 # A pull: nothing to do, a fast-forward, a merge, or conflicts.  Conflicts
 # leave HEAD and the working tree as they were, and are recorded in
@@ -844,8 +945,12 @@ mergeHeads root left right =
 Pulled = Type (UpToDate | FastForward String | Merged String | Conflicted (List J.Value)).
 pullWith root =
   local = head root;
-  _ = check (L.isEmpty (changes (snapshot root local) (tree (scan root)))) "dirty working copy: commit or restore before pulling";
   remote = fetchRemote root;
+  # a repository with no checkpoint yet takes the remote's ignore rules in
+  # place of the default init wrote, if that is still as written
+  _ = (if local == "" and remote != "" and field ".qrepoignore" (snapshot root remote) != J.Null and exists ".qrepoignore" and readPath ".qrepoignore" == defaultIgnore
+       then need (Qfs.remove ".qrepoignore") else Unit);
+  _ = check (L.isEmpty (changes (snapshot root local) (tree (scan root)))) "dirty working copy: commit or restore before pulling";
   if local == remote or isAncestor root remote local then UpToDate else
   if isAncestor root local remote then _ = checkout root remote; _ = removeIf (meta root "conflicts.json"); FastForward remote else
   (case mergeHeads root local remote of
@@ -884,7 +989,7 @@ commitMerge root message = if exists (meta root "conflicts.json") then finishMer
   local = head root;
   remote = S.trim (get root "REMOTE_HEAD");
   _ = check (local != "" and remote != "" and not (isAncestor root remote local) and not (isAncestor root local remote)) "no divergent fetched remote to resolve";
-  _ = closure root remote;
+  _ = verified root remote;
   commitWith root message [local, remote] True.
 conflictRecord root = parse (get root "conflicts.json").
 conflictedPaths rec = L.map (fn c -> text (field "path" c)) (seqValues (field "files" rec)).
@@ -894,7 +999,7 @@ finishMerge root message =
   local = text (field "local" rec);
   remote = text (field "remote" rec);
   _ = check (head root == local) "HEAD moved since the conflict was recorded: sync again";
-  _ = closure root remote;
+  _ = verified root remote;
   conflicted = Set.fromList Ord.string (conflictedPaths rec);
   (merged, _) = mergeStates root (rulesOn root) False (snapshot root (text (field "base" rec))) (snapshot root local) (snapshot root remote);
   files = scan root;
@@ -911,6 +1016,7 @@ finishMerge root message =
   id = identity "commit" commitBody;
   _ = save root "tree" body sid;
   _ = save root "commit" commitBody id;
+  _ = markMade root id [local, remote];
   _ = checkoutMerged root id;
   _ = need (Qfs.remove (meta root "conflicts.json"));
   print "merged {id}".
@@ -950,7 +1056,7 @@ resolveFile root path choice =
       | _ -> removeIf path).
 cloneRepo root url withToken =
   _ = check (L.isEmpty (L.filter (fn name -> name != ".qrepo") (ls ""))) "clone requires an empty directory";
-  _ = init root;
+  _ = initStore root;
   _ = configureRemote root url withToken;
   pull root.
 
@@ -1063,6 +1169,8 @@ gc root =
   dead = L.filter (fn name -> not (Set.member name live)) (ls (meta root "objects"));
   bytes = L.sum (L.map (fn name -> need (Qfs.size (meta root ("objects/" + name)))) dead);
   _ = each (fn name -> need (Qfs.remove (meta root ("objects/" + name)))) dead;
+  # the verified marks: what was just checked deeply, and only what is kept
+  _ = put root "verified" (strJoin "" (L.map (fn c -> cacheLine [c]) (L.filter (fn c -> Set.member c live) (L.append (Set.toList (loadMarks root)) roots))));
   print "removed {L.length dead} unreachable objects ({bytes} bytes); kept {Set.size live}".
 
 commands = "init|status [--json]|commit MESSAGE|history [--json]|diff|tag NAME|show REV PATH|restore REV PATH [--force]|ignore PATTERN|gc|config [device NAME|merge-rules on|off]|sync [--json]|blame PATH [--json]|conflicts [--json]|resolve PATH ours|theirs|both|merge-json BASE LEFT RIGHT|serve PORT [--address ADDRESS]|serve-token|clone REMOTE [--token-stdin]|remote REMOTE [--token-stdin]|fetch|pull|push|commit-merge MESSAGE|recover".

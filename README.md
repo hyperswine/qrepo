@@ -110,6 +110,29 @@ This permits unbounded operations and host effects; type and linearity checks
 still run. It is not a claim of WCET, bounded memory, or formally proven safety.
 No FP-RISC compiler/runtime changes are needed for this prototype.
 
+## History at scale
+
+An editor syncs every minute and every save is a commit, so a repository
+gains thousands of commits. Nothing a sync does walks all of them:
+
+- **Generation numbers** (`.qrepo/graph`): 1 + the highest of a commit's
+  parents'. A commit can be an ancestor only of higher generations, so "is X
+  behind Y" stops below X's generation, and "what does `tip` have that these
+  lack" and "where did two histories part" walk both sides at once, newest
+  generation first, and stop where they meet (as git does).
+- **Verified marks** (`.qrepo/verified`): commits whose whole history was
+  found present and sound. Fetch, push, pull and checkout check only what is
+  new below a tip, down to a marked commit. A commit made here from verified
+  parents is marked as it is made.
+
+Both are local caches, not format: each line carries a check (16 hex of the
+SHA-256 of the rest), so a torn or altered line is ignored and recomputed,
+and deleted files are rebuilt. `gc` checks every reachable object whole, as
+before, and rewrites the marks. What a mark does not cover any more is an
+object lost from disk below a verified commit after it was checked: `gc`
+finds that, a sync does not. With 1,500 commits of 500 files, an idle sync
+went from 7.0 s to 0.06 s (PERFORMANCE.md).
+
 ## Format 2
 
 Each immutable object is stored at `.qrepo/objects/<sha256>` as

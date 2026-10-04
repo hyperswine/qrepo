@@ -154,6 +154,83 @@ with tempfile.TemporaryDirectory(prefix='qrepo-sync-test-') as d:
     assert deleted == {'docs/notes.txt', 'docs/deep/y.bak', 'x.bak', 'v22.md', 'keep.md', '.qrepoignore'}, deleted
     print('Ignore patterns: names at any depth, * and ?, anchored paths, directories: PASS', flush=True)
 
+    # init writes the default .qrepoignore; it keeps other apps' scratch out
+    r = fresh('defaults')
+    cmd(r, 'init')
+    assert (r / '.qrepoignore').read_text() == (HOME / 'default.qrepoignore').read_text()
+    scratch = ['.DS_Store', '._notes.txt', '~$report.docx', '.~lock.sheet.ods#', 'notes.txt.swp', 'draft.md~',
+               'Thumbs.db', 'movie.mp4.part', 'sub/.DS_Store', 'sub/.Trashes/f', 'big.download/data']
+    for f in scratch + ['notes.txt', 'a~b.txt', 'sub/kept.txt']:
+        (r / f).parent.mkdir(parents=True, exist_ok=True)
+        (r / f).write_text('x')
+    added = {l[2:] for l in cmd(r, 'status').splitlines() if l.startswith('A ')}
+    assert added == {'.qrepoignore', 'notes.txt', 'a~b.txt', 'sub/kept.txt'}, added
+    # an empty repository pulling takes the remote's rules over the untouched
+    # default; one whose default was edited is left to say so
+    with Server(r) as s:
+        cmd(r, 'commit', 'defaults')
+        e = fresh('empty-init')
+        cmd(e, 'init')
+        cmd(e, 'remote', str(s.port))
+        cmd(e, 'pull')
+        assert (e / '.qrepoignore').read_text() == (r / '.qrepoignore').read_text() and (e / 'notes.txt').exists()
+        e2 = fresh('empty-init-edited')
+        cmd(e2, 'init')
+        (e2 / '.qrepoignore').write_text('mine\n')
+        cmd(e2, 'remote', str(s.port))
+        assert 'dirty working copy' in cmd(e2, 'pull', ok=False)
+    print('Default ignores: init writes them, scratch files stay out, an empty clone takes the remote\'s: PASS', flush=True)
+
+    # History caches: generations and verified marks are rebuilt when gone,
+    # and a torn or altered line is ignored, never believed.
+    server = fresh('cache-server')
+    cmd(server, 'init')
+    for i in range(30):
+        (server / 'n.txt').write_text(f'{i}\n')
+        cmd(server, 'commit', f'c{i}')
+    with Server(server) as s:
+        a = fresh('cache-a')
+        cmd(a, 'clone', str(s.port))
+        graph, marks = a / '.qrepo/graph', a / '.qrepo/verified'
+        assert marks.read_text() and not graph.exists()  # a clone from nothing needs no ancestry yet
+        (a / 'other.txt').write_text('x\n')
+        cmd(a, 'commit', 'other')
+        cmd(a, 'push')  # is the remote head an ancestor of ours? generations, from here on
+        assert len(graph.read_text().splitlines()) == 31  # 30 from the server, 1 here
+        first = json.loads(cmd(a, 'history', '--json'))[-1]['id']
+        # alter one generation, tear the last line: both fail their check
+        lines = graph.read_text().splitlines()
+        lines[0] = lines[0].replace(' 1 ', ' 999 ', 1)
+        graph.write_text('\n'.join(lines) + '\n' + lines[-1][:30])
+        (a / 'n.txt').write_text('local\n')
+        cmd(a, 'commit', 'local')
+        (server / 'n.txt').write_text('server\n')
+        cmd(server, 'commit', 'server')
+        assert 'merge conflict' in cmd(a, 'pull', ok=False)  # the base was found: same line, both sides
+        cmd(a, 'resolve', 'n.txt', 'ours')
+        cmd(a, 'commit-merge', 'mine')
+        cmd(a, 'push')
+        # gone entirely: rebuilt
+        graph.unlink()
+        marks.unlink()
+        (server / 'n.txt').write_text('after\n')
+        cmd(server, 'commit', 'after')  # the server's working tree was behind: this reverts, fine for a test
+        assert json.loads(cmd(a, 'sync', '--json'))['state'] == 'synced'
+        assert graph.exists() and marks.exists()
+        assert json.loads(cmd(a, 'status', '--json'))['sync'] == 'same'
+        # something missing BELOW verified history: fetch does not look again,
+        # gc does, and removes nothing
+        oldest_tree = json.loads((a / '.qrepo/objects' / first).read_bytes().split(b'\n', 1)[1])['root_state']
+        blob = next(iter(json.loads((a / '.qrepo/objects' / oldest_tree).read_bytes().split(b'\n', 1)[1]).values()))
+        saved = (a / '.qrepo/objects' / blob).read_bytes()
+        (a / '.qrepo/objects' / blob).unlink()
+        before = sorted(os.listdir(a / '.qrepo/objects'))
+        assert 'missing object' in cmd(a, 'gc', ok=False)
+        assert sorted(os.listdir(a / '.qrepo/objects')) == before
+        (a / '.qrepo/objects' / blob).write_bytes(saved)
+        assert 'removed' in cmd(a, 'gc')
+    print('History caches: rebuilt when gone, bad lines ignored, gc still checks everything: PASS', flush=True)
+
     # Collection.
     r = fresh('gc')
     cmd(r, 'init')
