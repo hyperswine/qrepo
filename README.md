@@ -91,6 +91,10 @@ refused in any tree, local or remote: `.qrepo` under any casing, and
   by device and inode, any path that resolves into the metadata directory
   under another spelling. It does not implement repository/merge policy or
   invoke subprocesses.
+- `vscode/`: the VS Code extension. It syncs a qrepo folder on its own, holds
+  unusual changes, settles conflicts with you (`qr resolve`, `commit-merge`)
+  and explains lines on hover; all repository work is `qr`'s. See
+  `vscode/README.md`.
 - `qr`: a compiled executable. It does not invoke Sol, Python, or the compiler;
   its only subprocesses are its own request workers and, on a client, `curl`.
   Python is used only by tests/benchmarks and the experiment driver.

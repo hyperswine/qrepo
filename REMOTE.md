@@ -107,10 +107,16 @@ it. To resolve by hand:
 ./qr --root /path/to/bob push
 ```
 
-`commit-merge` records both the local and fetched remote heads as parents. It
-is an explicit assertion that the caller has resolved the **whole working
-tree**, not just one file; it does not invent a resolution or copy remaining
-remote changes for you. Ordinary `commit` creates a single-parent checkpoint.
+`qr resolve PATH ours|theirs|both` writes a conflicting file as the merge
+would have made it, each conflicting region taken from this device's version,
+the remote's, or both (the remote's lines first); a file that is not text
+takes one side whole. With conflicts recorded, `commit-merge` finishes the
+merge: the conflicting paths as the working tree has them, every other path
+as the merge made it (the remote's changes elsewhere come along and are
+written out), both heads as parents. Anything else changed in the working
+tree refuses it. Without a record, `commit-merge` commits the working tree as
+the whole resolution, as before. Ordinary `commit` creates a single-parent
+checkpoint.
 
 ## Sync, for an editor
 
@@ -186,7 +192,10 @@ termination was tested; physical power failure was not.
   on, and published HEAD is preserved. `401` is a missing or wrong token,
   `404`/`405` is anything but `POST /qrepo`.
 - The listener handles one request at a time, each in a fresh process of the
-  same executable (`Proc.self`). The worker has no time limit: it reads local
+  same executable (`Proc.self`). A client that connects and then sends
+  nothing holds it for the 30 s silence limit; behind nginx that cannot
+  happen (nginx connects only with a request to forward), on a bare port it
+  can. The worker has no time limit: it reads local
   files, not the network. This is not yet an actor-based server: a failed
   `check` ends a process, and an actor is not one.
 - Limits, and where they come from: a frame, so an object, is as long as its

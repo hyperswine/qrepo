@@ -182,6 +182,37 @@ with tempfile.TemporaryDirectory(prefix='qrepo-textsync-test-') as d:
         run(a, 'blame', 'missing.txt', code=1)
         print('Blame: lines traced through merges to their checkpoint and device: PASS', flush=True)
 
+        # resolve: the merge with each conflicting region picked; commit-merge
+        # finishes it, bringing the remote's changes to other files along
+        js(a, 'sync')
+        js(b, 'sync')
+        write(a, 'todo.txt', read(a, 'todo.txt').replace('- tea', '- green tea'))
+        write(a, 'ideas.txt', read(a, 'ideas.txt') + 'laptop idea\n')
+        js(a, 'sync')
+        write(b, 'todo.txt', read(b, 'todo.txt').replace('- tea', '- black tea').replace('Groceries', 'GROCERIES'))
+        r = js(b, 'sync', code=3)
+        rec = js(b, 'conflicts')
+        assert (rec['localAuthor'], rec['remoteAuthor']) == ('phone', 'laptop'), rec
+        for pick, want in [('ours', '- black tea\n'), ('theirs', '- green tea\n'), ('both', '- green tea\n- black tea\n')]:
+            run(b, 'resolve', 'todo.txt', pick)
+            t = read(b, 'todo.txt')
+            assert want in t and t.startswith('GROCERIES') and ('black' in want or 'black' not in t), (pick, t)
+        run(b, 'resolve', 'todo.txt', 'sideways', code=2)
+        run(b, 'resolve', 'ideas.txt', 'ours', code=1)
+        assert 'laptop idea' not in read(b, 'ideas.txt')
+        write(b, 'stray.txt', 'x')
+        assert 'changed outside the conflicting files: stray.txt' in run(b, 'commit-merge', 'tea', code=1)
+        (b / 'stray.txt').unlink()
+        run(b, 'commit-merge', 'tea: both')
+        assert 'laptop idea' in read(b, 'ideas.txt') and not js(b, 'status')['conflicts']
+        assert js(b, 'status')['changes'] == []
+        h = js(b, 'history')[0]
+        assert len(h['parents']) == 2 and h['author'] == 'phone' and h['message'] == 'tea: both'
+        js(b, 'sync')
+        js(a, 'sync')
+        assert read(a, 'todo.txt') == read(b, 'todo.txt') and read(a, 'ideas.txt') == read(b, 'ideas.txt')
+        print('Resolve picks ours, theirs or both; commit-merge finishes the whole merge: PASS', flush=True)
+
         # without a remote, sync commits and says so
         solo = base / 'solo'
         solo.mkdir()

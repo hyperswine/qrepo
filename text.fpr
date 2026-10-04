@@ -168,12 +168,24 @@ applyGo base pos e es acc = case es of
 overlapping os ts = L.any (fn x -> L.any (fn y -> startOf x < endOf y and startOf y < endOf x) ts) os.
 
 merge3 : Bool -> Bool -> List String -> List String -> List String -> Result (List String) (List Hunk) .
-merge3 rules oursFirst base ours theirs =
+merge3 rules oursFirst base ours theirs = mergeWith Unpicked rules oursFirst base ours theirs.
+# The same merge, with every region that would conflict settled by a pick:
+# ours, theirs, or both (theirs' lines, then ours').  What did not conflict
+# merges exactly as merge3 merges it.
+Pick = Type (Unpicked | Ours | Theirs | Both).
+resolve3 : Pick -> Bool -> List String -> List String -> List String -> List String .
+resolve3 pick rules base ours theirs = case mergeWith pick rules False base ours theirs of Ok ls -> ls | Err _ -> ours.
+mergeWith pick rules oursFirst base ours theirs =
   wo = if oursFirst then 0 else 1;
   wt = 1 - wo;
   cs = clusters (L.sortWith byPlace (L.append (editsOf base ours wo) (editsOf base theirs wt)));
-  mergeGo rules base wo cs 0 0 0 [] [].
-mergeGo rules base wo cs pos offO offT out hunks = case cs of
+  mergeGo pick rules base wo cs 0 0 0 [] [].
+picked pick oursV theirsV = case pick of
+    Ours -> O.Some oursV
+  | Theirs -> O.Some theirsV
+  | Both -> O.Some (L.append theirsV oursV)
+  | Unpicked -> O.None.
+mergeGo pick rules base wo cs pos offO offT out hunks = case cs of
     [] -> if L.isEmpty hunks then Ok (L.concat (L.reverse (slice base pos (L.length base) :: out))) else Err (L.reverse hunks)
   | c :: rest ->
       s = L.fold (fn m x -> if startOf x < m then startOf x else m) (startOf (O.withDefault (Edit 0 0 0 []) (L.head c))) c;
@@ -183,13 +195,13 @@ mergeGo rules base wo cs pos offO offT out hunks = case cs of
       oursV = applyEdits base s e os;
       theirsV = applyEdits base s e ts;
       taken = if L.isEmpty ts then O.Some oursV else if L.isEmpty os then O.Some theirsV else if oursV == theirsV then O.Some oursV
-        else if overlapping os ts or not rules then O.None else O.Some (applyEdits base s e c);
+        else if overlapping os ts or not rules then picked pick oursV theirsV else O.Some (applyEdits base s e c);
       out2 = slice base pos s :: out;
       offO2 = offO + L.length oursV - (e - s);
       offT2 = offT + L.length theirsV - (e - s);
       (case taken of
-          O.Some ls -> mergeGo rules base wo rest e offO2 offT2 (ls :: out2) hunks
-        | O.None -> mergeGo rules base wo rest e offO2 offT2 out2 (Hunk s (slice base s e) (s + offO) oursV (s + offT) theirsV :: hunks)).
+          O.Some ls -> mergeGo pick rules base wo rest e offO2 offT2 (ls :: out2) hunks
+        | O.None -> mergeGo pick rules base wo rest e offO2 offT2 out2 (Hunk s (slice base s e) (s + offO) oursV (s + offT) theirsV :: hunks)).
 
 # ---- Blame ---------------------------------------------------------------------
 # Which lines of `now` were already in `before`, and where: a map from a line

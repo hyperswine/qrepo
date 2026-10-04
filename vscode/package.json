@@ -1,0 +1,47 @@
+{
+  "name": "qrepo",
+  "displayName": "QRepo",
+  "description": "Syncs a qrepo workspace on its own, holds unusual changes, settles conflicts with you, and shows where each line came from.",
+  "version": "0.1.0",
+  "publisher": "jasen",
+  "license": "UNLICENSED",
+  "repository": { "type": "git", "url": "https://github.com/hyperswine/qrepo" },
+  "engines": { "vscode": "^1.75.0" },
+  "categories": ["Other", "SCM Providers"],
+  "activationEvents": ["workspaceContains:.qrepo/config.json"],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "qrepo.menu", "title": "Actions…", "category": "qrepo" },
+      { "command": "qrepo.syncNow", "title": "Sync now", "category": "qrepo" },
+      { "command": "qrepo.syncAnyway", "title": "Sync held changes anyway", "category": "qrepo" },
+      { "command": "qrepo.keepMine", "title": "Resolve conflict: keep mine", "category": "qrepo" },
+      { "command": "qrepo.keepTheirs", "title": "Resolve conflict: keep theirs", "category": "qrepo" },
+      { "command": "qrepo.keepBoth", "title": "Resolve conflict: keep both", "category": "qrepo" },
+      { "command": "qrepo.compare", "title": "Compare conflict with the other device's version", "category": "qrepo" },
+      { "command": "qrepo.finishMerge", "title": "Finish merge (my edits are the resolution)", "category": "qrepo" },
+      { "command": "qrepo.pause", "title": "Pause syncing", "category": "qrepo" },
+      { "command": "qrepo.resume", "title": "Resume syncing", "category": "qrepo" }
+    ],
+    "configuration": {
+      "title": "QRepo",
+      "properties": {
+        "qrepo.path": { "type": "string", "default": "", "description": "The qr executable. Empty: `qr` on PATH." },
+        "qrepo.autoSync": { "type": "boolean", "default": true, "description": "Sync on a timer and after saves. Off: only `qrepo: Sync now`." },
+        "qrepo.syncInterval": { "type": "number", "default": 60, "minimum": 5, "description": "Seconds between syncs." },
+        "qrepo.idleDelay": { "type": "number", "default": 10, "minimum": 1, "description": "Seconds after a save before syncing." },
+        "qrepo.device": { "type": "string", "default": "", "description": "This device's name in history and hovers (qr config device). Empty: leave as it is." },
+        "qrepo.mergeRules": { "type": "boolean", "default": false, "description": "Merge edits that only touch (adjacent lines, both appending) instead of asking; both devices' lines are kept, the other device's first. Sets qr config merge-rules for this folder." },
+        "qrepo.hover": { "type": "boolean", "default": true, "description": "Show on hover which device and checkpoint wrote a line." },
+        "qrepo.hold.deletions": { "type": "boolean", "default": true, "description": "Hold a deleted file for a look before syncing it." },
+        "qrepo.hold.binary": { "type": "boolean", "default": false, "description": "Hold a changed binary file for a look before syncing it." },
+        "qrepo.hold.removedFraction": { "type": "number", "default": 0.5, "minimum": 0, "maximum": 1, "description": "Hold a text file that lost more than this share of its lines…" },
+        "qrepo.hold.removedLines": { "type": "number", "default": 10, "minimum": 1, "description": "…when that is at least this many lines." }
+      }
+    }
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "package": "node tools/package.js"
+  }
+}

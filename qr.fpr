@@ -753,7 +753,7 @@ writeAt root old new path =
 # that is not in the checkpoint it replaces
 guard root old new path =
   current = currentId path;
-  if current == field path old then Unit else
+  if current == field path old or current == field path new then Unit else
   if current == J.Text "directory" and field path new != J.Null then
     (case L.filter (fn f -> not (field f old != J.Null and field f new == J.Null and currentId f == field f old)) (below path) of
         [] -> Unit
@@ -851,7 +851,8 @@ pullWith root =
   (case mergeHeads root local remote of
       Ok id -> _ = checkout root id; _ = removeIf (meta root "conflicts.json"); Merged id
     | Err (base, conflicts) ->
-        _ = put root "conflicts.json" (encode (obj [("local", J.Text local), ("remote", J.Text remote), ("base", J.Text base), ("files", J.Sequence conflicts)]));
+        _ = put root "conflicts.json" (encode (obj [("local", J.Text local), ("remote", J.Text remote), ("base", J.Text base),
+          ("localAuthor", field "author" (record root local)), ("remoteAuthor", field "author" (record root remote)), ("files", J.Sequence conflicts)]));
         Conflicted conflicts).
 # a hunk's side as one line of text: its lines, without their newlines, joined by " / "
 sideText v = case L.map (fn t -> x = text t; if S.endsWith "\n" x then substr x 0 (strlen x - 1) else x) (seqValues (field "text" v)) of
@@ -873,13 +874,80 @@ showConflicts root json = if not (exists (meta root "conflicts.json")) then (if 
         _ = print "  at line {at} of this device's version:";
         L.map (fn which -> print ("    " + S.padRight 8 " " (which + ":") + sideText (field which h))) ["base", "ours", "theirs"]) (seqValues (field "hunks" c))) (seqValues (field "files" report));
     Unit.
-commitMerge root message =
+# With conflicts recorded, commit-merge finishes the merge: the conflicting
+# paths as the working tree now has them (the resolution), every other path as
+# the merge made it -- the remote's changes elsewhere included -- committed
+# with both heads as parents and checked out.  Anything else changed in the
+# working tree refuses it: a resolution touches only what conflicted.
+# Without a record, it commits the working tree as the whole resolution.
+commitMerge root message = if exists (meta root "conflicts.json") then finishMerge root message else
   local = head root;
   remote = S.trim (get root "REMOTE_HEAD");
   _ = check (local != "" and remote != "" and not (isAncestor root remote local) and not (isAncestor root local remote)) "no divergent fetched remote to resolve";
   _ = closure root remote;
-  _ = commitWith root message [local, remote] True;
-  removeIf (meta root "conflicts.json").
+  commitWith root message [local, remote] True.
+conflictRecord root = parse (get root "conflicts.json").
+conflictedPaths rec = L.map (fn c -> text (field "path" c)) (seqValues (field "files" rec)).
+finishMerge root message =
+  _ = check (message != "") "commit message required";
+  rec = conflictRecord root;
+  local = text (field "local" rec);
+  remote = text (field "remote" rec);
+  _ = check (head root == local) "HEAD moved since the conflict was recorded: sync again";
+  _ = closure root remote;
+  conflicted = Set.fromList Ord.string (conflictedPaths rec);
+  (merged, _) = mergeStates root (rulesOn root) False (snapshot root (text (field "base" rec))) (snapshot root local) (snapshot root remote);
+  files = scan root;
+  now = tree files;
+  others = L.filter (fn p -> not (Set.member p conflicted)) (changes (snapshot root local) now);
+  _ = check (L.isEmpty others) ("changed outside the conflicting files: " + S.join ", " others + " (commit-merge settles only the conflict)");
+  final = obj (L.append (L.filter (fn item -> case item of (p, _) -> not (Set.member p conflicted)) (pairs merged))
+                        (L.concat (L.map (fn p -> case field p now of J.Null -> [] | v -> [(p, v)]) (Set.toList conflicted))));
+  _ = validateState final;
+  _ = each (fn item -> case item of (p, key) -> if Set.member p conflicted then storeFile root p key else Unit) files;
+  body = encode final;
+  sid = identity "tree" body;
+  commitBody = encode (obj [("root_state", J.Text sid), ("parents", J.Sequence [J.Text local, J.Text remote]), ("author", J.Text (device root)), ("timestamp", J.Integer (Clock.now Unit)), ("message", J.Text message), ("metadata", obj [])]);
+  id = identity "commit" commitBody;
+  _ = save root "tree" body sid;
+  _ = save root "commit" commitBody id;
+  _ = checkoutMerged root id;
+  _ = need (Qfs.remove (meta root "conflicts.json"));
+  print "merged {id}".
+# a checkout whose working tree may already hold what it writes (the guard
+# accepts that); every other path was checked clean by the caller
+checkoutMerged root target =
+  old = snapshot root (head root);
+  new = snapshot root target;
+  _ = each (guard root old new) (changes old new);
+  _ = put root "checkout.json" (encode (obj [("before", J.Text (head root)), ("target", J.Text target)]));
+  recoverCheckout root.
+
+# Settle one conflicting file in the working tree by a pick: the merge as it
+# would have been, each conflicting region taken from ours, theirs or both
+# (text only).  For a file that is not text, ours or theirs is the whole
+# version, or its absence.  Then commit-merge.
+resolveFile root path choice =
+  rec = conflictRecord root;
+  entry = case L.filter (fn c -> text (field "path" c) == path) (seqValues (field "files" rec)) of
+      c :: _ -> c
+    | [] -> Program.fail 1 ("not in conflict: " + path);
+  kind = text (field "kind" entry);
+  version = fn id -> field path (snapshot root (text (field id rec)));
+  (b, l, r) = (version "base", version "local", version "remote");
+  pick = (case choice of "ours" -> T.Ours | "theirs" -> T.Theirs | "both" -> T.Both | _ -> Program.fail 2 "resolve PATH ours|theirs|both");
+  if kind == "text" then
+    lines = fn v -> case v of J.Text id -> T.linesOf (load root "blob" id) | _ -> [];
+    body = T.textOf (T.resolve3 pick (rulesOn root) (lines b) (lines l) (lines r));
+    id = identity "blob" body;
+    _ = save root "blob" body id;
+    _ = makeParents (S.split "/" path) "";
+    checkoutBlob root id path
+  else
+    _ = check (choice != "both") ("a " + kind + " conflict keeps one side: ours or theirs");
+    (case (if choice == "ours" then l else r) of
+        J.Text id -> _ = makeParents (S.split "/" path) ""; checkoutBlob root id path
+      | _ -> removeIf path).
 cloneRepo root url withToken =
   _ = check (L.isEmpty (L.filter (fn name -> name != ".qrepo") (ls ""))) "clone requires an empty directory";
   _ = init root;
@@ -997,7 +1065,7 @@ gc root =
   _ = each (fn name -> need (Qfs.remove (meta root ("objects/" + name)))) dead;
   print "removed {L.length dead} unreachable objects ({bytes} bytes); kept {Set.size live}".
 
-commands = "init|status [--json]|commit MESSAGE|history [--json]|diff|tag NAME|show REV PATH|restore REV PATH [--force]|ignore PATTERN|gc|config [device NAME|merge-rules on|off]|sync [--json]|blame PATH [--json]|conflicts [--json]|merge-json BASE LEFT RIGHT|serve PORT [--address ADDRESS]|serve-token|clone REMOTE [--token-stdin]|remote REMOTE [--token-stdin]|fetch|pull|push|commit-merge MESSAGE|recover".
+commands = "init|status [--json]|commit MESSAGE|history [--json]|diff|tag NAME|show REV PATH|restore REV PATH [--force]|ignore PATTERN|gc|config [device NAME|merge-rules on|off]|sync [--json]|blame PATH [--json]|conflicts [--json]|resolve PATH ours|theirs|both|merge-json BASE LEFT RIGHT|serve PORT [--address ADDRESS]|serve-token|clone REMOTE [--token-stdin]|remote REMOTE [--token-stdin]|fetch|pull|push|commit-merge MESSAGE|recover".
 usage u = Program.fail 2 ("usage: qr [--root DIRECTORY] " + commands).
 run : String -> List String -> Unit .
 run root ["init"] = init root.
@@ -1027,6 +1095,7 @@ dispatch root ["sync", "--json"] = syncRepo root True.
 dispatch root ["blame", path] = blameFile root path False.
 dispatch root ["blame", path, "--json"] = blameFile root path True.
 dispatch root ["conflicts"] = showConflicts root False.
+dispatch root ["resolve", path, choice] = resolveFile root path choice.
 dispatch root ["conflicts", "--json"] = showConflicts root True.
 dispatch root ("config" :: rest) = configure root rest.
 dispatch root ["commit", message] = commit root message.
