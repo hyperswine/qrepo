@@ -5,6 +5,7 @@ Program = use "std/program".
 Clock = use "std/clock".
 Set = use "std/set".
 Merge = use "merge".
+T = use "text".
 
 Encoding = use "std/encoding".
 Tcp = use "std/tcp".
@@ -219,6 +220,34 @@ status root =
     observed = S.trim (readPathOr "" (meta root "REMOTE_HEAD"));
     print (if observed == head root then "sync: matches last observed remote (use fetch to refresh)" else "sync: differs from last observed remote (use pull/push)").
 
+# ---- Changes, measured -----------------------------------------------------------
+# A file is text when its first 8 KiB hold no NUL byte; only text is measured
+# in lines (a binary file is never read whole to be measured).
+textAt path offset = n = need (Qfs.size path) - offset; not (S.contains (chr 0) (need (Qfs.readAt path offset (if n < 8192 then n else 8192)))).
+# one changed path: how it changed, and for text, lines added and removed
+# and how many lines the checkpoint had (an editor can judge "most of it went")
+fileChange root old now p = Sys.arena (fn u ->
+  kind = if field p old == J.Null then "A" else if field p now == J.Null then "D" else "M";
+  isText = (case field p old of J.Text id -> textAt (objectPath root id) 5 | _ -> True) and (kind == "D" or textAt p 0);
+  before = if isText then (case field p old of J.Text id -> T.linesOf (load root "blob" id) | _ -> []) else [];
+  after = if isText and kind != "D" then T.linesOf (readPath p) else [];
+  (added, removed) = T.changeCounts before after;
+  obj [("path", J.Text p), ("change", J.Text kind), ("text", J.Boolean isText), ("added", J.Integer added), ("removed", J.Integer removed), ("lines", J.Integer (L.length before))]).
+# where this repository stands against the remote head it last saw
+syncState root = if not (exists (meta root "remote.json")) then "local-only" else
+  local = head root;
+  remote = S.trim (readPathOr "" (meta root "REMOTE_HEAD"));
+  if local == remote then "same" else if isAncestor root remote local then "ahead" else if isAncestor root local remote then "behind" else "diverged".
+statusJson root =
+  old = snapshot root (head root);
+  seen = walkAll root;
+  now = tree (files seen);
+  paths = changes old now;
+  print (encode (obj [("head", J.Text (head root)), ("device", J.Text (device root)), ("sync", J.Text (syncState root)),
+    ("conflicts", J.Boolean (exists (meta root "conflicts.json"))),
+    ("changes", J.Sequence (L.map (fileChange root old now) paths)),
+    ("skipped", J.Sequence (L.map J.Text (skips seen)))])).
+
 init : String -> Unit .
 init root =
   _ = check (not (exists (meta root "config.json"))) "already initialized";
@@ -228,9 +257,28 @@ init root =
   _ = put root "config.json" (encode (obj [("format", J.Integer 2), ("mode", J.Text "local-only")]));
   print "initialized native local QRepo (format 2)".
 
+# ---- This device's settings: .qrepo/config.json, never synced --------------------
+# device       the name its commits carry as their author ("local" until set)
+# merge-rules  "on": the text merge's rules (text.fpr) resolve concurrent
+#              insertions and same-length edits to different lines
+configValue root key = field key (parse (get root "config.json")).
+device root = case configValue root "device" of J.Text d -> d | _ -> "local".
+rulesOn root = configValue root "merge-rules" == J.Text "on".
+setConfig root key value =
+  others = L.filter (fn item -> case item of (k, _) -> k != key) (pairs (parse (get root "config.json")));
+  put root "config.json" (encode (obj (L.append others [(key, value)]))).
+printable t = t != "" and L.all (fn c -> c >= 32 and c != 127) (L.map (charAt t) (L.range 0 (strlen t - 1))).
+configure root args = case args of
+    [] -> print (encode (parse (get root "config.json")))
+  | ["device", name] -> _ = check (printable name) "a device name is printable text"; setConfig root "device" (J.Text name)
+  | ["merge-rules", "on"] -> setConfig root "merge-rules" (J.Text "on")
+  | ["merge-rules", "off"] -> setConfig root "merge-rules" (J.Text "off")
+  | _ -> Program.fail 2 "qr config [device NAME | merge-rules on|off]".
+
 commit : String -> String -> Unit .
 commit root message = commitWith root message (if head root == "" then [] else [head root]) False.
-commitWith root message commitParents allowSame =
+commitWith root message commitParents allowSame = id = makeCommit root message commitParents allowSame; print "local checkpoint: {id}".
+makeCommit root message commitParents allowSame =
   _ = check (message != "") "commit message required";
   parent = head root;
   old = snapshot root parent;
@@ -239,14 +287,14 @@ commitWith root message commitParents allowSame =
   _ = check (allowSame or parent == "" or not (L.isEmpty (changes old state))) "nothing changed";
   body = encode state;
   stateId = identity "tree" body;
-  rec = obj [("root_state", J.Text stateId), ("parents", J.Sequence (L.map J.Text commitParents)), ("author", J.Text "local"), ("timestamp", J.Integer (Clock.now Unit)), ("message", J.Text message), ("metadata", obj [])];
+  rec = obj [("root_state", J.Text stateId), ("parents", J.Sequence (L.map J.Text commitParents)), ("author", J.Text (device root)), ("timestamp", J.Integer (Clock.now Unit)), ("message", J.Text message), ("metadata", obj [])];
   recBody = encode rec;
   id = identity "commit" recBody;
   _ = each (fn item -> case item of (p, key) -> storeFile root p key) files;
   _ = save root "tree" body stateId;
   _ = save root "commit" recBody id;
   _ = put root "HEAD" id;
-  print "local checkpoint: {id}".
+  id.
 
 parents rec = case field "parents" rec of J.Sequence xs -> L.map text xs | _ -> Program.fail 1 "invalid parents".
 
@@ -255,6 +303,12 @@ history root id = if id == "" then Unit else
   rec = record root id;
   _ = print (id + " " + text (field "message" rec));
   case parents rec of [] -> Unit | p :: _ -> history root p.
+# the first-parent line, newest first, as JSON
+historyJson root = print (encode (J.Sequence (historyGo root (head root) []))).
+historyGo root id acc = if id == "" then L.reverse acc else
+  rec = record root id;
+  entry = obj [("id", J.Text id), ("message", field "message" rec), ("author", field "author" rec), ("timestamp", field "timestamp" rec), ("parents", field "parents" rec)];
+  historyGo root (case parents rec of [] -> "" | p :: _ -> p) (entry :: acc).
 
 resolveId root name = if name == "HEAD" then head root else if validId name then name else
   text (field name (parse (get root "tags.json"))).
@@ -599,6 +653,11 @@ takeToken root =
   _ = check (token != "" and L.all (fn c -> c > 32 and c < 127) (L.map (charAt token) (L.range 0 (strlen token - 1)))) "the token on standard input is empty or not printable ASCII";
   put root "remote-token" token.
 remoteCall root header ids =
+  (answer, resp, objects) = remoteAsk root header ids;
+  _ = check (field "ok" answer == J.Boolean True) (case field "error" answer of J.Text why -> why | _ -> "remote refused request");
+  (answer, resp, objects).
+# a request whose refusal (ok: false) is an answer, not a failure
+remoteAsk root header ids =
   url = remoteUrl root;
   dir = meta root "spool/client";
   _ = clearSpool root dir;
@@ -629,7 +688,6 @@ remoteCall root header ids =
             Err why -> _ = removeIf resp; Program.fail 1 ("remote: " + why)
           | Ok (answer, objects) ->
               _ = check (field "version" answer == J.Integer 3) "unsupported remote protocol";
-              _ = check (field "ok" answer == J.Boolean True) (case field "error" answer of J.Text why -> why | _ -> "remote refused request");
               (answer, resp, objects))).
 # what this repository already holds, to be left out of a transfer
 haves root = L.filter validId [head root, S.trim (readPathOr "" (meta root "REMOTE_HEAD"))].
@@ -642,16 +700,21 @@ fetchRemote root =
   _ = closure root tip;
   _ = put root "REMOTE_HEAD" tip;
   tip.
-push root =
+push root = case pushTry root of
+    Ok target -> print "pushed {target}"
+  | Err why -> Program.fail 1 why.
+# Ok: pushed.  Err: the remote moved on since it was last seen (stale).
+pushTry root =
   target = head root;
   expected = S.trim (readPathOr "" (meta root "REMOTE_HEAD"));
   _ = check (target != "") "no checkpoint to push";
   _ = check (isAncestor root expected target) "local history diverged: pull before pushing";
-  (answer, resp, objects) = remoteCall root [("op", J.Text "push"), ("head", J.Text target), ("expected", J.Text expected)] (pack root target (L.filter validId [expected]));
+  (answer, resp, objects) = remoteAsk root [("op", J.Text "push"), ("head", J.Text target), ("expected", J.Text expected)] (pack root target (L.filter validId [expected]));
   _ = removeIf resp;
-  _ = check (field "head" answer == J.Text target) "unexpected push acknowledgement";
-  _ = put root "REMOTE_HEAD" target;
-  print "pushed {target}".
+  if field "ok" answer != J.Boolean True then Err (case field "error" answer of J.Text why -> why | _ -> "remote refused request") else
+    _ = check (field "head" answer == J.Text target) "unexpected push acknowledgement";
+    _ = put root "REMOTE_HEAD" target;
+    Ok target.
 
 # Checkout journal supports idempotent completion after an interrupted pull.
 # What stands at a path now: nothing, a file (by its identity), or something a
@@ -721,56 +784,201 @@ checkout root target =
   _ = put root "checkout.json" (encode (obj [("before", J.Text before), ("target", J.Text target)]));
   recoverCheckout root.
 
-# Conservative three-way merge: individual file identities first, then JSON.
-mergeValue root path base left right =
-  if left == right then left else if base == left then right else if base == right then left else
-    case (base, left, right) of
-      (J.Text b, J.Text l, J.Text r) ->
-        candidate = case (J.parse (load root "blob" b), J.parse (load root "blob" l), J.parse (load root "blob" r)) of
-          (Ok bv, Ok lv, Ok rv) -> (case Merge.merge bv lv rv of Ok v -> v | Err why -> Program.fail 1 ("merge conflict at " + path + ": " + why))
-        | _ -> Program.fail 1 ("merge conflict at " + path + " (non-JSON content)");
-        body = encode candidate;
-        id = identity "blob" body;
-        _ = save root "blob" body id;
-        J.Text id
-    | _ -> Program.fail 1 ("merge conflict at " + path + " (delete/modify or concurrent add)").
-mergeStates root base left right = obj (L.filter (fn item -> case item of (_, v) -> v != J.Null)
-  (L.map (fn p -> (p, mergeValue root p (field p base) (field p left) (field p right))) (Set.toList (Set.fromList Ord.string (L.concat [keys base left, keys base right]))))).
+# Three-way merge, file by file: identities first, then JSON (when all three
+# versions parse), then text, line by line (text.fpr).  A file that cannot be
+# merged is a conflict, reported with where it lies; every file is tried, so
+# one report names them all.  A file added on both sides merges as text from
+# an empty base.  Each file's work runs in an arena of its own.
+mergeValue root rules oursFirst path base left right =
+  if left == right then Ok left else if base == left then Ok right else if base == right then Ok left else
+    case (left, right) of
+      (J.Text l, J.Text r) -> Sys.arena (fn u -> mergeBodies root rules oursFirst path base l r)
+    | _ -> Err (conflictOf path "delete/modify" "one side deleted the file, the other changed it" []).
+mergeBodies root rules oursFirst path base l r =
+  b = case base of J.Text id -> load root "blob" id | _ -> "";
+  lb = load root "blob" l;
+  rb = load root "blob" r;
+  saved = fn body -> id = identity "blob" body; _ = save root "blob" body id; Ok (J.Text id);
+  json = case base of J.Text _ -> (case (J.parse b, J.parse lb, J.parse rb) of (Ok bv, Ok lv, Ok rv) -> O.Some (bv, lv, rv) | _ -> O.None) | _ -> O.None;
+  case json of
+      O.Some (bv, lv, rv) -> (case Merge.merge bv lv rv of
+          Ok v -> saved (encode v)
+        | Err why -> Err (conflictOf path "json" why []))
+    | O.None ->
+        if S.contains (chr 0) b or S.contains (chr 0) lb or S.contains (chr 0) rb then Err (conflictOf path "binary" "both sides changed a binary file" []) else
+        (case T.merge3 rules oursFirst (T.linesOf b) (T.linesOf lb) (T.linesOf rb) of
+            Ok lines -> saved (T.textOf lines)
+          | Err hunks -> Err (conflictOf path "text" "both sides changed the same lines" (L.map hunkJson hunks))).
+conflictOf path kind why hunks = obj [("path", J.Text path), ("kind", J.Text kind), ("why", J.Text why), ("hunks", J.Sequence hunks)].
+side at lines = obj [("line", J.Integer at), ("text", J.Sequence (L.map J.Text lines))].
+hunkJson h = case h of T.Hunk i bs a os b ts -> obj [("base", side i bs), ("ours", side a os), ("theirs", side b ts)].
+mergeStates root rules oursFirst base left right =
+  results = L.map (fn p -> (p, mergeValue root rules oursFirst p (field p base) (field p left) (field p right))) (Set.toList (Set.fromList Ord.string (L.concat [keys base left, keys base right])));
+  conflicts = L.concat (L.map (fn item -> case item of (_, Err c) -> [c] | _ -> []) results);
+  kept = L.concat (L.map (fn item -> case item of (p, Ok v) -> (if v == J.Null then [] else [(p, v)]) | _ -> []) results);
+  (obj kept, conflicts).
 commonBase root left right =
   common = Set.toList (Set.intersect (ancestors root left) (ancestors root right));
   dominated = Set.fromList Ord.string (L.concatMap (fn id -> parents (record root id)) common);
   nearest = L.filter (fn candidate -> not (Set.member candidate dominated)) common;
   case nearest of [one] -> one | [] -> Program.fail 1 "unrelated histories" | _ -> Program.fail 1 "multiple merge bases: manual merge required".
+# the merged commit, or every file that conflicts.  With the rules on, lines
+# both sides inserted at one place go the remote's first: they reached the
+# server first.  (Not by commit time: devices' clocks differ, and seconds tie.)
 mergeHeads root left right =
   base = commonBase root left right;
-  state = mergeStates root (snapshot root base) (snapshot root left) (snapshot root right);
-  _ = validateState state;
-  body = encode state;
-  sid = identity "tree" body;
-  rec = encode (obj [("root_state", J.Text sid), ("parents", J.Sequence [J.Text left, J.Text right]), ("author", J.Text "local"), ("timestamp", J.Integer (Clock.now Unit)), ("message", J.Text "Merge remote checkpoint"), ("metadata", obj [])]);
-  id = identity "commit" rec;
-  _ = save root "tree" body sid;
-  _ = save root "commit" rec id;
-  id.
-pull root =
+  (state, conflicts) = mergeStates root (rulesOn root) False (snapshot root base) (snapshot root left) (snapshot root right);
+  if not (L.isEmpty conflicts) then Err (base, conflicts) else
+    _ = validateState state;
+    body = encode state;
+    sid = identity "tree" body;
+    rec = encode (obj [("root_state", J.Text sid), ("parents", J.Sequence [J.Text left, J.Text right]), ("author", J.Text (device root)), ("timestamp", J.Integer (Clock.now Unit)), ("message", J.Text "Merge remote checkpoint"), ("metadata", obj [])]);
+    id = identity "commit" rec;
+    _ = save root "tree" body sid;
+    _ = save root "commit" rec id;
+    Ok id.
+# A pull: nothing to do, a fast-forward, a merge, or conflicts.  Conflicts
+# leave HEAD and the working tree as they were, and are recorded in
+# .qrepo/conflicts.json (qr conflicts) until a pull merges or commit-merge
+# resolves them.
+Pulled = Type (UpToDate | FastForward String | Merged String | Conflicted (List J.Value)).
+pullWith root =
   local = head root;
   _ = check (L.isEmpty (changes (snapshot root local) (tree (scan root)))) "dirty working copy: commit or restore before pulling";
   remote = fetchRemote root;
-  if local == remote or isAncestor root remote local then print "up to date (local may be ahead)" else
-    target = if isAncestor root local remote then remote else mergeHeads root local remote;
-    _ = checkout root target;
-    print (if target == remote then "pulled {target}" else "merged remote into {target}; push to publish").
+  if local == remote or isAncestor root remote local then UpToDate else
+  if isAncestor root local remote then _ = checkout root remote; _ = removeIf (meta root "conflicts.json"); FastForward remote else
+  (case mergeHeads root local remote of
+      Ok id -> _ = checkout root id; _ = removeIf (meta root "conflicts.json"); Merged id
+    | Err (base, conflicts) ->
+        _ = put root "conflicts.json" (encode (obj [("local", J.Text local), ("remote", J.Text remote), ("base", J.Text base), ("files", J.Sequence conflicts)]));
+        Conflicted conflicts).
+# a hunk's side as one line of text: its lines, without their newlines, joined by " / "
+sideText v = case L.map (fn t -> x = text t; if S.endsWith "\n" x then substr x 0 (strlen x - 1) else x) (seqValues (field "text" v)) of
+    [] -> "(nothing)"
+  | xs -> S.join " / " xs.
+conflictPaths cs = S.join ", " (L.map (fn c -> text (field "path" c)) cs).
+pull root = case pullWith root of
+    UpToDate -> print "up to date (local may be ahead)"
+  | FastForward id -> print "pulled {id}"
+  | Merged id -> print "merged remote into {id}; push to publish"
+  | Conflicted cs -> Program.fail 1 ("merge conflict in " + conflictPaths cs + " (qr conflicts shows where)").
+showConflicts root json = if not (exists (meta root "conflicts.json")) then (if json then print "null" else print "no conflicts") else
+  report = parse (get root "conflicts.json");
+  if json then print (encode report) else
+    _ = L.map (fn c ->
+      _ = print ("conflict in " + text (field "path" c) + " (" + text (field "kind" c) + "): " + text (field "why" c));
+      L.map (fn h ->
+        at = case field "line" (field "ours" h) of J.Integer n -> n + 1 | _ -> 0;
+        _ = print "  at line {at} of this device's version:";
+        L.map (fn which -> print ("    " + S.padRight 8 " " (which + ":") + sideText (field which h))) ["base", "ours", "theirs"]) (seqValues (field "hunks" c))) (seqValues (field "files" report));
+    Unit.
 commitMerge root message =
   local = head root;
   remote = S.trim (get root "REMOTE_HEAD");
   _ = check (local != "" and remote != "" and not (isAncestor root remote local) and not (isAncestor root local remote)) "no divergent fetched remote to resolve";
   _ = closure root remote;
-  commitWith root message [local, remote] True.
+  _ = commitWith root message [local, remote] True;
+  removeIf (meta root "conflicts.json").
 cloneRepo root url withToken =
   _ = check (L.isEmpty (L.filter (fn name -> name != ".qrepo") (ls ""))) "clone requires an empty directory";
   _ = init root;
   _ = configureRemote root url withToken;
   pull root.
+
+# ---- Sync: commit, pull, push as one step ---------------------------------------
+# What an editor runs on a timer.  It commits whatever changed (an editor
+# decides beforehand whether a change is ordinary enough to commit without
+# asking: status --json measures it), pulls, merging if both sides moved, and
+# pushes; a push refused because the remote moved on in between is pulled and
+# tried once more.  With conflicts recorded it commits nothing: if the working
+# tree is as HEAD left it, it tries the merge again (the rules or the remote
+# may have changed); once someone is editing a resolution, it leaves the files
+# alone until commit-merge.
+# States: local (no remote), synced, conflict (exit 3), behind (the remote
+# kept moving; try again later).
+intOf v = case v of J.Integer n -> n | _ -> 0.
+autoMessage root old now paths = "auto: " + S.join ", " (L.map (fn p ->
+  c = fileChange root old now p;
+  kind = text (field "change" c);
+  if kind == "M" and field "text" c == J.Boolean True then p + " +{intOf (field "added" c)} -{intOf (field "removed" c)}" else kind + " " + p) paths).
+orNull t = if t == "" then J.Null else J.Text t.
+syncRepo root json =
+  pending = exists (meta root "conflicts.json");
+  old = snapshot root (head root);
+  paths = changes old (tree (scan root));
+  if pending and not (L.isEmpty paths) then syncReport root json "conflict" "" "" "" (seqValues (field "files" (parse (get root "conflicts.json")))) else
+  committed = if L.isEmpty paths then "" else
+    now = tree (scan root);
+    makeCommit root (autoMessage root old now paths) (if head root == "" then [] else [head root]) False;
+  if not (exists (meta root "remote.json")) then syncReport root json "local" committed "" "" [] else
+  syncRound root json committed 2.
+syncRound root json committed tries = case pullWith root of
+    Conflicted cs -> syncReport root json "conflict" committed "" "" cs
+  | pulled ->
+      how = (case pulled of FastForward _ -> "fast-forward" | Merged _ -> "merged" | _ -> "");
+      if head root == "" or head root == S.trim (readPathOr "" (meta root "REMOTE_HEAD")) then syncReport root json "synced" committed how "" [] else
+      (case pushTry root of
+          Ok id -> syncReport root json "synced" committed how id []
+        | Err why -> if tries > 1 then syncRound root json committed (tries - 1) else syncReport root json "behind" committed how "" []).
+syncReport root json state committed pulled pushed cs =
+  _ = (if json then print (encode (obj [("state", J.Text state), ("committed", orNull committed), ("pulled", orNull pulled), ("pushed", orNull pushed), ("head", J.Text (head root)), ("conflicts", J.Sequence cs)]))
+    else
+      _ = (if committed == "" then Unit else print "committed {committed}");
+      _ = (if pulled == "" then Unit else print "pulled ({pulled})");
+      _ = (if pushed == "" then Unit else print "pushed {pushed}");
+      print (if state == "conflict" then "merge conflict in " + conflictPaths cs + " (qr conflicts shows where)" else if state == "behind" then "the remote kept moving; sync again" else if state == "local" then "no remote configured" else "in sync"));
+  if state == "conflict" then Program.exit 3 else Unit.
+
+# ---- Blame --------------------------------------------------------------------
+# Which checkpoint each line of a file comes from: the working file's lines,
+# traced back through history.  A line the working file has and HEAD does not
+# is uncommitted.  At each checkpoint a line is followed into the first parent
+# that has it (a merge's lines go to whichever side had them), and belongs to
+# the checkpoint where no parent has it.  Where a parent holds the same file
+# unchanged, every line passes to it without a diff.
+blobIn root c path = Sys.arena (fn u -> case field path (snapshot root c) of J.Text b -> b | _ -> "").
+blameFile root path json =
+  _ = check (validPath path) "unsafe path";
+  tip = head root;
+  blobId = if tip == "" then "" else blobIn root tip path;
+  committed = if blobId == "" then [] else T.linesOf (load root "blob" blobId);
+  lines = if exists path then T.linesOf (readPath path) else committed;
+  _ = check (exists path or blobId != "") ("no such file: " + path);
+  toHead = T.carried committed lines;
+  pending = L.concat (L.map (fn k -> case M.get k toHead of O.Some i -> [(i, k)] | O.None -> []) (L.range 0 (L.length lines - 1)));
+  owners = M.fromList Ord.int (if blobId == "" then [] else blameWalk root path tip blobId pending []);
+  perLine = L.map (fn k -> M.getOr "" k owners) (L.range 0 (L.length lines - 1));
+  if json then
+    used = Set.toList (Set.fromList Ord.string (L.filter (fn c -> c != "") perLine));
+    info = fn c -> rec = record root c; (c, obj [("author", field "author" rec), ("timestamp", field "timestamp" rec), ("message", field "message" rec)]);
+    print (encode (obj [("path", J.Text path), ("head", J.Text tip), ("lines", J.Integer (L.length lines)),
+      ("ranges", J.Sequence (L.map (fn r -> case r of (a, b, c) -> obj [("start", J.Integer a), ("end", J.Integer b), ("commit", orNull c)]) (runs perLine 0 []))),
+      ("commits", obj (L.map info used))]))
+  else
+    authors = M.fromList Ord.string (L.map (fn c -> (c, text (field "author" (record root c)))) (Set.toList (Set.fromList Ord.string (L.filter (fn c -> c != "") perLine))));
+    _ = L.map (fn pair -> case pair of (c, line) ->
+      print ((if c == "" then "uncommitted        " else substr c 0 8 + " " + S.padRight 10 " " (M.getOr "" c authors)) + " | " + (if S.endsWith "\n" line then substr line 0 (strlen line - 1) else line))) (L.zip perLine lines);
+    Unit.
+# Each step loads the two versions and diffs them in an arena of its own;
+# only blob identities and line numbers travel down the history.
+blameWalk root path c blobId pending acc = if L.isEmpty pending then acc else
+  blameParents root path c blobId pending (parents (record root c)) acc.
+blameParents root path c blobId pending ps acc = case ps of
+    [] -> L.append (L.map (fn pk -> case pk of (_, k) -> (k, c)) pending) acc
+  | p :: rest ->
+      pBlob = blobIn root p path;
+      if pBlob == blobId then blameWalk root path p blobId pending acc else
+      if pBlob == "" then blameParents root path c blobId pending rest acc else
+        (inherited, left) = Sys.arena (fn u ->
+          back = T.carried (T.linesOf (load root "blob" pBlob)) (T.linesOf (load root "blob" blobId));
+          (L.concat (L.map (fn pk -> case pk of (i, k) -> (case M.get i back of O.Some j -> [(j, k)] | O.None -> [])) pending),
+           L.filter (fn pk -> case pk of (i, _) -> not (M.member i back)) pending));
+        blameParents root path c blobId left rest (blameWalk root path p pBlob inherited acc).
+# consecutive lines with one owner, as (start, end exclusive, owner)
+runs owners at acc = case owners of
+    [] -> L.reverse acc
+  | o :: rest -> n = L.length (L.takeWhile (fn x -> x == o) owners); runs (L.drop n owners) (at + n) ((at, at + n, o) :: acc).
 
 # ---- Collection ---------------------------------------------------------------
 # What nothing reaches: objects of refused or interrupted transfers, of
@@ -789,7 +997,7 @@ gc root =
   _ = each (fn name -> need (Qfs.remove (meta root ("objects/" + name)))) dead;
   print "removed {L.length dead} unreachable objects ({bytes} bytes); kept {Set.size live}".
 
-commands = "init|status|commit MESSAGE|history|diff|tag NAME|show REV PATH|restore REV PATH [--force]|ignore PATTERN|gc|merge-json BASE LEFT RIGHT|serve PORT [--address ADDRESS]|serve-token|clone REMOTE [--token-stdin]|remote REMOTE [--token-stdin]|fetch|pull|push|commit-merge MESSAGE|recover".
+commands = "init|status [--json]|commit MESSAGE|history [--json]|diff|tag NAME|show REV PATH|restore REV PATH [--force]|ignore PATTERN|gc|config [device NAME|merge-rules on|off]|sync [--json]|blame PATH [--json]|conflicts [--json]|merge-json BASE LEFT RIGHT|serve PORT [--address ADDRESS]|serve-token|clone REMOTE [--token-stdin]|remote REMOTE [--token-stdin]|fetch|pull|push|commit-merge MESSAGE|recover".
 usage u = Program.fail 2 ("usage: qr [--root DIRECTORY] " + commands).
 run : String -> List String -> Unit .
 run root ["init"] = init root.
@@ -812,6 +1020,15 @@ dispatch root ["commit-merge", message] = commitMerge root message.
 dispatch root ["pull"] = pull root.
 dispatch root ["recover"] = recoverCheckout root.
 dispatch root ["status"] = status root.
+dispatch root ["status", "--json"] = statusJson root.
+dispatch root ["history", "--json"] = historyJson root.
+dispatch root ["sync"] = syncRepo root False.
+dispatch root ["sync", "--json"] = syncRepo root True.
+dispatch root ["blame", path] = blameFile root path False.
+dispatch root ["blame", path, "--json"] = blameFile root path True.
+dispatch root ["conflicts"] = showConflicts root False.
+dispatch root ["conflicts", "--json"] = showConflicts root True.
+dispatch root ("config" :: rest) = configure root rest.
 dispatch root ["commit", message] = commit root message.
 dispatch root ["history"] = history root (head root).
 dispatch root ["diff"] = _ = diff root; Unit.

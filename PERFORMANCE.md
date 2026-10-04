@@ -63,6 +63,23 @@ hashed once, when it enters the store (README, Safety). What remains grows
 with the number of paths and commits (trees, sets of identities), not with
 the bytes.
 
+## Text diff and merge, 2026-10-04
+
+A 5,000-line file with 8 scattered edits on each of two devices, and a
+2,000-line CSV one device rewrote entirely while the other shuffled it:
+
+| | Myers alone | Patience + Myers |
+|---|---:|---:|
+| `status --json` | 8.1 s, 2,579 MB | 0.02 s, 28 MB |
+| `sync` merging both | 28.2 s, 7,145 MB | 0.08 s, 52 MB |
+
+Same results: the 16 edits merge, the CSV is one conflict. Myers' trace is
+O(D^2) in the lines that differ, and a rewrite makes D the whole file; the
+patience step leaves Myers only the gaps without unique lines, minus lines
+the other side never has. `blame` of that 5,000-line file over 200 commits,
+each changing it: 1.1 s, 153 MB (each step's diff in an arena; the line
+numbers carried down grow with lines times depth).
+
 ## Remaining costs
 
 - Scans read/hash the complete included working tree every time.

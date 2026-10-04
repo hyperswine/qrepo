@@ -263,38 +263,107 @@ def restore_on_other_device():
     bump('undo:other-device')
 
 
-def same_file_conflict():
-    """Both devices edit the same file before syncing: the second to sync
-    gets a refusal, merges by hand, and nothing is lost."""
+def lines_of(root, f):
+    return (read(root, f) or '').split('\n')[:-1]
+
+
+def ensure_lines(f, n):
+    """Give `f` at least n lines on both devices, synced, so edits can be
+    placed apart from each other or on the same line on purpose."""
     converge()
+    ls = lines_of(A, f)
+    if len(ls) < n:
+        (A / f).write_text('\n'.join(ls + [f'- filler {i}' for i in range(n - len(ls))]) + '\n')
+        commit(A, f'pad {f}')
+        push(A)
+        converge()
+
+
+def same_file_conflict():
+    """Both devices change the SAME line differently before syncing: sync
+    stops with a conflict saying where; the person merges by hand, and
+    nothing is lost."""
     f = rng.choice(FILES)
-    edit(A, f)
-    commit(A, f'A edits {f}')
+    ensure_lines(f, 3)
+    ls = lines_of(A, f)
+    i = rng.randrange(len(ls))
+    mine_a, mine_b = f'{ls[i]} [A: {sentence()}]', f'{ls[i]} [B: {sentence()}]'
+    (A / f).write_text('\n'.join(ls[:i] + [mine_a] + ls[i + 1:]) + '\n')
+    commit(A, f'A edits line {i} of {f}')
     push(A)
-    mark = f'- B wrote this offline ({rng.randrange(10**6)})'
-    text = read(B, f) or ''
-    (B / f).write_text(text + mark + '\n')
-    commit(B, f'B edits {f}')
-    out = qr(B, 'push', ok=False)
-    if 'stale push' not in out:
-        fail('a stale push was not refused: ' + out)
-    out = qr(B, 'pull', ok=False)
-    if 'merge conflict' not in out:
-        fail('a same-file edit merged silently: ' + out)
-    # their resolution: take A's version and add their own line back
-    remote = (B / '.qrepo/REMOTE_HEAD').read_text().strip()
+    (B / f).write_text('\n'.join(ls[:i] + [mine_b] + ls[i + 1:]) + '\n')
+    out = qr(B, 'sync', '--json', ok=False)
+    r = json.loads(out[:out.rindex('}') + 1])
+    if r['state'] != 'conflict':
+        fail('a same-line edit did not conflict: ' + out)
+    hunk = r['conflicts'][0]['hunks'][0]
+    if hunk['ours']['text'] != [mine_b + '\n'] or hunk['theirs']['text'] != [mine_a + '\n'] or hunk['ours']['line'] != i:
+        fail('the conflict is not where the edits were: ' + json.dumps(hunk))
+    mine.append(r['committed'])
+    checkpoints[r['committed']] = state(B)
+    # their resolution: A's version of the file, with both versions of the line
+    remote = json.loads(qr(B, 'conflicts', '--json'))['remote']
     theirs = subprocess.run([QR, '--root', str(B), 'show', remote, f], capture_output=True).stdout.decode()
-    (B / f).write_text(theirs + mark + '\n')
+    (B / f).write_text(theirs.replace(mine_a + '\n', mine_a + '\n' + mine_b + '\n'))
     out = qr(B, 'commit-merge', f'B merges {f}')
     cid = out.strip().split()[-1]
     checkpoints[cid] = state(B)
     mine.append(cid)
     push(B)
     pull(A)
-    if mark not in read(A, f) or theirs not in read(A, f):
+    if mine_a not in read(A, f) or mine_b not in read(A, f):
         fail('a hand merge lost one side')
     expect(A, state(B), 'after a hand merge')
     bump('conflicts-resolved')
+
+
+def same_file_merge():
+    """A edits near the top while B appends at the bottom of the same file:
+    lines apart, so sync merges them with nobody asked."""
+    f = rng.choice(FILES)
+    ensure_lines(f, 4)
+    ls = lines_of(A, f)
+    i = rng.randrange(len(ls) - 2)
+    edited = f'{ls[i]} (A, {rng.randrange(10**6)})'
+    (A / f).write_text('\n'.join(ls[:i] + [edited] + ls[i + 1:]) + '\n')
+    commit(A, f'A edits line {i} of {f}')
+    push(A)
+    added = f'- B appended {rng.randrange(10**6)}'
+    (B / f).write_text('\n'.join(ls + [added]) + '\n')
+    r = json.loads(qr(B, 'sync', '--json'))
+    if r['state'] != 'synced' or r['pulled'] != 'merged':
+        fail('edits lines apart did not merge: ' + json.dumps(r))
+    mine.extend([r['committed'], r['head']])
+    checkpoints[r['head']] = state(B)
+    want = '\n'.join(ls[:i] + [edited] + ls[i + 1:] + [added]) + '\n'
+    if read(B, f) != want:
+        fail(f'the merge of {f} is not both edits: {read(B, f)!r}')
+    pull(A)
+    expect(A, state(B), 'after an automatic merge')
+    bump('same-file-merges')
+
+
+def both_append_rules():
+    """Both append to the same file; B has the merge rules on, so both lines
+    are kept, the remote's first."""
+    f = rng.choice(FILES)
+    ensure_lines(f, 1)
+    ls = lines_of(A, f)
+    la, lb = f'- A appended {rng.randrange(10**6)}', f'- B appended {rng.randrange(10**6)}'
+    (A / f).write_text('\n'.join(ls + [la]) + '\n')
+    commit(A, f'A appends to {f}')
+    push(A)
+    (B / f).write_text('\n'.join(ls + [lb]) + '\n')
+    r = json.loads(qr(B, 'sync', '--json'))
+    if r['state'] != 'synced':
+        fail('two appends did not merge under the rules: ' + json.dumps(r))
+    mine.extend([r['committed'], r['head']])
+    checkpoints[r['head']] = state(B)
+    if read(B, f) != '\n'.join(ls + [la, lb]) + '\n':
+        fail(f'appends in the wrong order: {read(B, f)!r}')
+    pull(A)
+    expect(A, state(B), 'after merged appends')
+    bump('append-merges')
 
 
 def other_file_on_b():
@@ -329,6 +398,9 @@ def write_results(result, why=''):
 token = pathlib.Path(args.tokenfile).read_bytes()
 qr(A, 'clone', args.remote, '--token-stdin', stdin=token)
 qr(B, 'clone', args.remote, '--token-stdin', stdin=token)
+qr(A, 'config', 'device', 'device-a')
+qr(B, 'config', 'device', 'device-b')
+qr(B, 'config', 'merge-rules', 'on')
 checkpoints[head(A)] = state(A)
 for f in FILES:
     (A / f).write_text(f'# {f[:-4]}\n')
@@ -337,7 +409,8 @@ push(A)
 pull(B)
 
 scenarios = [undo_delete_uncommitted, undo_delete_committed, discard_pile_of_edits,
-             roll_back_several, restore_on_other_device, same_file_conflict, other_file_on_b]
+             roll_back_several, restore_on_other_device, same_file_conflict, other_file_on_b,
+             same_file_merge, both_append_rules]
 rounds = 0
 while time.time() - started < args.seconds:
     rounds += 1

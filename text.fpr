@@ -1,0 +1,198 @@
+# Line-level text: a diff, and a three-way merge.  Policy lives here, beside
+# the JSON merge in merge.fpr; qr.fpr decides which one a file gets.
+#
+# A text is its lines, each keeping its own "\n"; the last may have none, so
+# joining the lines gives back the exact bytes.  Two lines are equal when
+# their bytes are, terminator included.
+L = use "std/list".
+M = use "std/map".
+O = use "std/option".
+S = use "std/string".
+Ord = use "std/order".
+
+linesOf : String -> List String .
+linesOf t = if t == "" then [] else linesGo (S.split "\n" t).
+linesGo parts = case parts of
+    [] -> []
+  | last :: [] -> if last == "" then [] else [last]
+  | p :: rest -> (p + "\n") :: linesGo rest.
+textOf : List String -> String .
+textOf lines = strJoin "" lines.
+
+# ---- The diff ------------------------------------------------------------------
+# Which lines of `xs` and `ys` are the same line: (i, j) pairs, both rising.
+#
+# Patience diff, as git offers it.  Trim the common prefix and suffix; among
+# what is left, the lines that occur exactly ONCE in each version are
+# anchors, and the longest run of anchors in the same order on both sides
+# (a longest increasing subsequence, O(n log n)) is matched; then the same
+# again in each gap between anchors.  Only a gap with no unique line in common
+# goes to Myers' O(ND) algorithm, after dropping the lines the other side
+# does not have at all (they can never match), and in an arena of its own,
+# because Myers' trace is O(D^2).  So a rewritten file (nothing in common)
+# and a sorted one (every line unique) cost O(n log n), not O(n^2) memory.
+matches : List String -> List String -> List (Int, Int) .
+matches xs ys = L.reverse (diffGo (L.indexed xs) (L.indexed ys) []).
+# xs, ys: (original index, line); acc: matches found so far, newest first
+diffGo xs ys acc = case (xs, ys) of
+    ([], _) -> acc
+  | (_, []) -> acc
+  | ((i, x) :: xr, (j, y) :: yr) -> if x == y then diffGo xr yr ((i, j) :: acc) else
+      xb = L.reverse xs;
+      yb = L.reverse ys;
+      k = tailLen xb yb 0;
+      tail = L.zip (L.reverse (L.take k xb)) (L.reverse (L.take k yb));
+      middle = patience (L.reverse (L.drop k xb)) (L.reverse (L.drop k yb)) acc;
+      L.append (L.reverse (L.map (fn p -> case p of ((i2, _), (j2, _)) -> (i2, j2)) tail)) middle.
+tailLen xb yb k = case (xb, yb) of
+    ((_, x) :: xr, (_, y) :: yr) -> if x == y then tailLen xr yr (k + 1) else k
+  | _ -> k.
+counts xs = L.fold (fn m p -> case p of (_, x) -> M.insert x (M.getOr 0 x m + 1) m) (M.empty Ord.string) xs.
+# the matches of two indexed runs that share neither first nor last line,
+# put in front of acc (newest first, as diffGo keeps them: nothing is appended
+# to the end of what is already found, so the work stays O(n log n))
+patience xs ys acc =
+  cx = counts xs;
+  cy = counts ys;
+  uy = M.fromList Ord.string (L.filter (fn p -> case p of (y, _) -> M.getOr 0 y cy == 1) (L.map (fn p -> case p of (j, y) -> (y, j)) ys));
+  common = L.concat (L.map (fn p -> case p of (i, x) -> if M.getOr 0 x cx == 1 then (case M.get x uy of O.Some j -> [(i, j)] | O.None -> []) else []) xs);
+  if L.isEmpty common then L.append (L.reverse (myersOf xs ys)) acc else gaps xs ys (lis common) acc.
+# between consecutive anchors, diff again; the anchors themselves match
+gaps xs ys anchors acc = case anchors of
+    [] -> diffGo xs ys acc
+  | a :: rest -> (case a of (ai, aj) ->
+      xl = L.takeWhile (fn p -> case p of (i, _) -> i < ai) xs;
+      yl = L.takeWhile (fn p -> case p of (j, _) -> j < aj) ys;
+      gaps (L.drop (L.length xl + 1) xs) (L.drop (L.length yl + 1) ys) rest ((ai, aj) :: diffGo xl yl acc)).
+# the longest subsequence of (i, j) pairs, i rising as given, whose j rise too
+lis pairs =
+  (tails, back, n) = L.fold (fn st p -> case st of (tails, back, n) -> (case p of (i, j) ->
+      at = place tails j 0 n;
+      prev = if at == 0 then O.None else M.get (at - 1) tails;
+      (M.insert at (i, j) tails, M.insert i prev back, if at == n then n + 1 else n)))
+    (M.empty Ord.int, M.empty Ord.int, 0) pairs;
+  (case M.get (n - 1) tails of O.None -> [] | O.Some last -> chain back (O.Some last) []).
+# the first pile whose top j is not below `j` (binary search over 0..n)
+place tails j lo hi = if lo >= hi then lo else
+  mid = (lo + hi) / 2;
+  (case M.get mid tails of
+      O.Some (_, mj) -> if mj < j then place tails j (mid + 1) hi else place tails j lo mid
+    | O.None -> lo).
+chain back cur acc = case cur of
+    O.None -> acc
+  | O.Some (i, j) -> chain back (M.getOr O.None i back) ((i, j) :: acc).
+# Myers on what is left, without the lines the other side never has
+myersOf xs ys = Sys.arena (fn u ->
+  cy = counts ys;
+  cx = counts xs;
+  xk = L.filter (fn p -> case p of (_, x) -> M.member x cy) xs;
+  yk = L.filter (fn p -> case p of (_, y) -> M.member y cx) ys;
+  xv = indexMap (L.map (fn p -> case p of (_, x) -> x) xk);
+  yv = indexMap (L.map (fn p -> case p of (_, y) -> y) yk);
+  xi = indexMap (L.map (fn p -> case p of (i, _) -> i) xk);
+  yi = indexMap (L.map (fn p -> case p of (j, _) -> j) yk);
+  L.map (fn p -> case p of (a, b) -> (M.getOr 0 a xi, M.getOr 0 b yi)) (myers xv (L.length xk) yv (L.length yk))).
+indexMap xs = M.fromList Ord.int (L.indexed xs).
+eqAt am bm x y = case (M.get x am, M.get y bm) of (O.Some p, O.Some q) -> p == q | _ -> False.
+none = 0 - 1.
+
+myers am n bm m = if n == 0 or m == 0 then [] else
+  backtrack (forward am n bm m 0 (M.insert 1 0 (M.empty Ord.int)) []) n m [].
+# the frontier before each step, newest first; the last is the step that finished
+forward am n bm m d v trace = case step am n bm m d (0 - d) v of
+  (v2, done) -> if done then v :: trace else forward am n bm m (d + 1) v2 (v :: trace).
+step am n bm m d k v = if k > d then (v, False) else
+  x0 = if k == 0 - d then M.getOr 0 (k + 1) v
+    else if k != d and M.getOr none (k - 1) v < M.getOr none (k + 1) v then M.getOr 0 (k + 1) v
+    else M.getOr 0 (k - 1) v + 1;
+  x = snake am n bm m x0 (x0 - k);
+  v2 = M.insert k x v;
+  if x >= n and x - k >= m then (v2, True) else step am n bm m d (k + 2) v2.
+snake am n bm m x y = if x < n and y < m then (if eqAt am bm x y then snake am n bm m (x + 1) (y + 1) else x) else x.
+backtrack trace x y acc = case trace of
+    [] -> acc
+  | v :: rest ->
+      d = L.length rest;
+      k = x - y;
+      pk = if k == 0 - d then k + 1 else if k != d and M.getOr none (k - 1) v < M.getOr none (k + 1) v then k + 1 else k - 1;
+      px = M.getOr 0 pk v;
+      py = px - pk;
+      (acc2, done) = diagonal x y px py acc;
+      if d == 0 then acc2 else backtrack rest px py acc2.
+diagonal x y px py acc = if x > px and y > py then diagonal (x - 1) (y - 1) px py ((x - 1, y - 1) :: acc) else (acc, True).
+
+# lines added and removed, going from `xs` to `ys`
+changeCounts : List String -> List String -> (Int, Int) .
+changeCounts xs ys = k = L.length (matches xs ys); (L.length ys - k, L.length xs - k).
+
+# ---- The merge -----------------------------------------------------------------
+# Each side, against the base, is a list of EDITS: base lines [start, end)
+# replaced by some lines (an insertion has start = end).  One side's edits
+# never touch each other: a kept line lies between any two.  Edits of both
+# sides are taken in order and gathered into CLUSTERS of edits that overlap
+# or touch.  A cluster of one side's edits takes that side; one where both
+# sides came out the same takes it once.  Otherwise:
+#   - edits that truly OVERLAP -- both changed a line, or one inserted inside
+#     what the other replaced -- conflict;
+#   - edits that only TOUCH -- adjacent lines, an insertion at the edge of
+#     the other's edit, or both inserting at one place -- conflict without
+#     the rules (git's behaviour), and with them are all applied in order;
+#     lines both inserted at one place go `ours` first when oursFirst, else
+#     `theirs` first (qr.fpr puts the remote's first).
+# A conflict is the cluster: where it starts in each version, and its lines.
+Hunk = Type (Hunk Int (List String) Int (List String) Int (List String)).
+Edit = Type (Edit Int Int Int (List String)).
+startOf e = case e of Edit s _ _ _ -> s.
+endOf e = case e of Edit _ x _ _ -> x.
+sideOf e = case e of Edit _ _ w _ -> w.
+linesIn e = case e of Edit _ _ _ ls -> ls.
+slice xs from to = L.take (to - from) (L.drop from xs).
+editsOf base side who = editsGo side who (L.append (matches base side) [(L.length base, L.length side)]) 0 0 [].
+editsGo side who ms i j acc = case ms of
+    [] -> L.reverse acc
+  | pair :: rest -> (case pair of (mi, mj) ->
+      editsGo side who rest (mi + 1) (mj + 1) (if mi > i or mj > j then Edit i mi who (slice side j mj) :: acc else acc)).
+# by start, then end (an insertion before what starts where it is), then side
+# (Ord.thenBy takes the tie-breaker first: thenBy second first)
+byPlace = Ord.thenBy (Ord.by sideOf Ord.int) (Ord.thenBy (Ord.by endOf Ord.int) (Ord.by startOf Ord.int)).
+clusters es = case es of [] -> [] | x :: rest -> clusterGo rest [x] (endOf x) [].
+clusterGo es cur e acc = case es of
+    [] -> L.reverse (L.reverse cur :: acc)
+  | y :: rest -> if startOf y <= e then clusterGo rest (y :: cur) (if endOf y > e then endOf y else e) acc
+      else clusterGo rest [y] (endOf y) (L.reverse cur :: acc).
+# base lines [s, e) with these edits (in order) applied
+applyEdits base s e es = applyGo base s e es [].
+applyGo base pos e es acc = case es of
+    [] -> L.concat (L.reverse (slice base pos e :: acc))
+  | x :: rest -> applyGo base (endOf x) e rest (linesIn x :: slice base pos (startOf x) :: acc).
+overlapping os ts = L.any (fn x -> L.any (fn y -> startOf x < endOf y and startOf y < endOf x) ts) os.
+
+merge3 : Bool -> Bool -> List String -> List String -> List String -> Result (List String) (List Hunk) .
+merge3 rules oursFirst base ours theirs =
+  wo = if oursFirst then 0 else 1;
+  wt = 1 - wo;
+  cs = clusters (L.sortWith byPlace (L.append (editsOf base ours wo) (editsOf base theirs wt)));
+  mergeGo rules base wo cs 0 0 0 [] [].
+mergeGo rules base wo cs pos offO offT out hunks = case cs of
+    [] -> if L.isEmpty hunks then Ok (L.concat (L.reverse (slice base pos (L.length base) :: out))) else Err (L.reverse hunks)
+  | c :: rest ->
+      s = L.fold (fn m x -> if startOf x < m then startOf x else m) (startOf (O.withDefault (Edit 0 0 0 []) (L.head c))) c;
+      e = L.fold (fn m x -> if endOf x > m then endOf x else m) s c;
+      os = L.filter (fn x -> sideOf x == wo) c;
+      ts = L.filter (fn x -> sideOf x != wo) c;
+      oursV = applyEdits base s e os;
+      theirsV = applyEdits base s e ts;
+      taken = if L.isEmpty ts then O.Some oursV else if L.isEmpty os then O.Some theirsV else if oursV == theirsV then O.Some oursV
+        else if overlapping os ts or not rules then O.None else O.Some (applyEdits base s e c);
+      out2 = slice base pos s :: out;
+      offO2 = offO + L.length oursV - (e - s);
+      offT2 = offT + L.length theirsV - (e - s);
+      (case taken of
+          O.Some ls -> mergeGo rules base wo rest e offO2 offT2 (ls :: out2) hunks
+        | O.None -> mergeGo rules base wo rest e offO2 offT2 out2 (Hunk s (slice base s e) (s + offO) oursV (s + offT) theirsV :: hunks)).
+
+# ---- Blame ---------------------------------------------------------------------
+# Which lines of `now` were already in `before`, and where: a map from a line
+# of `now` to its line in `before`.
+carried : List String -> List String -> M.Map Int Int .
+carried before now = M.fromList Ord.int (L.map (fn p -> case p of (i, j) -> (j, i)) (matches before now)).

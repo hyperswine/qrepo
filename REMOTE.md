@@ -70,20 +70,37 @@ A JSON merge returns the numbers it was given: an integer past 62 bits is
 carried as its text, not converted. It still rewrites the file in the
 renderer's compact form, so a pretty-printed file comes back on one line.
 
-On divergence, pull finds a unique nearest common ancestor. It merges file
-identities first: changes to different files, identical edits, and uncontested
-deletions merge automatically. When both sides modify an existing JSON file,
-the existing recursive JSON merge policy combines disjoint fields. Arrays and
-scalars remain atomic. Conflicting text/binary edits, delete/modify pairs,
-concurrent differing additions, unrelated histories, or multiple merge bases
-are refused. There is no project-schema validation hook wired into pull yet.
+On divergence, pull finds a unique nearest common ancestor and merges file by
+file. Changes to different files, identical edits, and uncontested deletions
+merge as before. When both sides changed one file:
 
-A refused conflict leaves local HEAD and working files unchanged, although
-fetched objects and REMOTE_HEAD remain available. To resolve explicitly:
+- **JSON** (all three versions parse): the recursive JSON merge combines
+  disjoint fields; arrays and scalars are atomic.
+- **Text** (no NUL byte): a line merge (`text.fpr`). Each side is a list of
+  edits against the base, found by patience diff. Edits apart from each other
+  merge, and so do identical ones. Edits that truly overlap (both changed a
+  line, or one inserted inside what the other replaced) conflict. Edits that
+  only **touch** (adjacent lines, an insertion at the edge of the other's
+  edit, or both inserting at one place) conflict too, as in git, unless
+  `qr config merge-rules on`: then they are applied in order, and lines both
+  inserted at one place go **the remote's first** (they reached the server
+  first; commit times are not used, since clocks differ and seconds tie). A
+  file added on both sides merges as text from an empty base.
+- **Binary**, delete/modify, unrelated histories and multiple merge bases
+  conflict.
+
+**Every** conflicting file is found and recorded together in
+`.qrepo/conflicts.json`, which `qr conflicts` prints (`--json` for an editor):
+for each file its kind and, for text, each conflicting region's lines in the
+base, this device's version ("ours", with its line number) and the remote's
+("theirs"). A conflict leaves local HEAD and working files unchanged, although
+fetched objects and REMOTE_HEAD remain available. The record goes when a later
+pull merges (say, after the rules are turned on) or `commit-merge` resolves
+it. To resolve by hand:
 
 ```sh
-./qr --root /path/to/bob show HEAD state.json
-# Read .qrepo/REMOTE_HEAD and use that ID with `show` for the remote version.
+./qr --root /path/to/bob conflicts
+./qr --root /path/to/bob show <remote id from conflicts> todo.txt
 # Edit the working tree to the complete desired result, retaining any other
 # independent remote changes as well.
 ./qr --root /path/to/bob commit-merge "Resolve conflict"
@@ -94,6 +111,27 @@ fetched objects and REMOTE_HEAD remain available. To resolve explicitly:
 is an explicit assertion that the caller has resolved the **whole working
 tree**, not just one file; it does not invent a resolution or copy remaining
 remote changes for you. Ordinary `commit` creates a single-parent checkpoint.
+
+## Sync, for an editor
+
+`qr sync` is what an editor runs on a timer: commit whatever changed (as
+`auto: todo.txt +3 -1, A new.txt`), pull (merging), push, and on a push
+refused because the remote moved meanwhile, pull and push once more. With
+`--json` it answers `{"state", "committed", "pulled", "pushed", "head",
+"conflicts"}`; state is `synced`, `local` (no remote), `behind` (the remote
+kept moving: try later) or `conflict` (exit status 3). With conflicts
+recorded it commits nothing: while the working tree is as HEAD left it, it
+tries the merge again; once someone edits a resolution, it leaves the files
+alone until `commit-merge`.
+
+Deciding whether a change is ordinary enough to commit unasked is the
+editor's: `qr status --json` measures each changed path (`change` A/M/D,
+`text`, lines `added` and `removed`, and the `lines` the checkpoint had)
+without reading a binary file whole. `qr blame PATH --json` gives, for each
+run of lines, the checkpoint that wrote them and its device, author and time;
+lines not yet committed have none. Commits carry the device name set with
+`qr config device NAME` (`local` until then); `config` is per device and is
+never synced.
 
 ## Checkout and recovery
 

@@ -1,0 +1,59 @@
+unsafe base.
+T = use "../text".
+L = use "std/list".
+check b msg = if b then Unit else error msg.
+text ls = T.textOf ls.
+merged rules first base ours theirs = case T.merge3 rules first (T.linesOf base) (T.linesOf ours) (T.linesOf theirs) of
+    Ok ls -> T.textOf ls
+  | Err _ -> "CONFLICT".
+conflicts rules first base ours theirs = case T.merge3 rules first (T.linesOf base) (T.linesOf ours) (T.linesOf theirs) of
+    Ok _ -> 0
+  | Err hs -> L.length hs.
+counts a b = T.changeCounts (T.linesOf a) (T.linesOf b).
+main =
+  # lines round-trip, terminators and all
+  _ = L.map (fn t -> check (T.textOf (T.linesOf t) == t) ("round trip: " + t)) ["", "a", "a\n", "a\nb", "a\nb\n", "\n\n", "a\n\nb\n"];
+  _ = check (L.length (T.linesOf "a\nb\n") == 2 and L.length (T.linesOf "a\nb") == 2) "line count";
+  # the diff: counts of added and removed lines
+  _ = check (counts "a\nb\nc\n" "a\nb\nc\n" == (0, 0)) "same";
+  _ = check (counts "a\nb\nc\n" "a\nb\nc\nd\n" == (1, 0)) "append";
+  _ = check (counts "a\nb\nc\n" "a\nc\n" == (0, 1)) "delete middle";
+  _ = check (counts "a\nb\nc\n" "a\nB\nc\n" == (1, 1)) "change middle";
+  _ = check (counts "" "x\ny\n" == (2, 0)) "from empty";
+  _ = check (counts "a\nb\nc\nd\ne\n" "x\na\nc\ne\ny\n" == (2, 2)) "scattered";
+  _ = check (counts "a\nb\nc\na\nb\nb\na\n" "c\nb\na\nb\na\nc\n" == (2, 3)) "Myers' example: D = 5";
+  _ = check (L.length (T.matches (T.linesOf "a\nb\nc\na\nb\nb\na\n") (T.linesOf "c\nb\na\nb\na\nc\n")) == 4) "LCS length 4";
+  # merges that always apply
+  base = "one\ntwo\nthree\nfour\nfive\n";
+  _ = check (merged False True base "ONE\ntwo\nthree\nfour\nfive\n" "one\ntwo\nthree\nfour\nFIVE\n" == "ONE\ntwo\nthree\nfour\nFIVE\n") "distant edits";
+  _ = check (merged False True base "one\ntwo\nthree\nfour\nfive\nsix\n" base == "one\ntwo\nthree\nfour\nfive\nsix\n") "one side appends";
+  _ = check (merged False True base "one\nthree\nfour\nfive\n" "one\ntwo\nthree\nfour\nfive\nsix\n" == "one\nthree\nfour\nfive\nsix\n") "delete and append";
+  _ = check (merged False True base "one\nTWO\nthree\nfour\nfive\n" "one\nTWO\nthree\nfour\nfive\n" == "one\nTWO\nthree\nfour\nfive\n") "identical edits";
+  _ = check (merged False True "" "a\n" "" == "a\n") "empty base";
+  # conflicts without the rules
+  _ = check (merged False True base "one\ntwo\nthree\nfour\nfive\nA\n" "one\ntwo\nthree\nfour\nfive\nB\n" == "CONFLICT") "both append, rules off";
+  _ = check (merged False True base "one\nX\nthree\nfour\nfive\n" "one\nY\nthree\nfour\nfive\n" == "CONFLICT") "same line, different words";
+  _ = check (merged False True base "one\nTWO\nthree\nfour\nfive\n" "one\ntwo\nTHREE\nfour\nfive\n" == "CONFLICT") "adjacent lines, rules off";
+  _ = check (merged False True base "one\nthree\nfour\nfive\n" "one\nTWO\nthree\nfour\nfive\n" == "CONFLICT") "delete versus edit";
+  _ = check (conflicts False True base "X\ntwo\nthree\nfour\nY\n" "Z\ntwo\nthree\nfour\nW\n" == 2) "two separate hunks";
+  # the rules
+  _ = check (merged True True base "one\ntwo\nthree\nfour\nfive\nA\n" "one\ntwo\nthree\nfour\nfive\nB\n" == "one\ntwo\nthree\nfour\nfive\nA\nB\n") "both append: ours first";
+  _ = check (merged True False base "one\ntwo\nthree\nfour\nfive\nA\n" "one\ntwo\nthree\nfour\nfive\nB\n" == "one\ntwo\nthree\nfour\nfive\nB\nA\n") "both append: theirs first";
+  _ = check (merged True True base "one\nA\ntwo\nthree\nfour\nfive\n" "one\nB\ntwo\nthree\nfour\nfive\n" == "one\nA\nB\ntwo\nthree\nfour\nfive\n") "both insert mid-file";
+  _ = check (merged True True base "one\nTWO\nthree\nfour\nfive\n" "one\ntwo\nTHREE\nfour\nfive\n" == "one\nTWO\nTHREE\nfour\nfive\n") "adjacent lines, rules on";
+  _ = check (merged True True base "one\nX\nthree\nfour\nfive\n" "one\nY\nthree\nfour\nfive\n" == "CONFLICT") "same line still conflicts with rules";
+  _ = check (merged True True base "one\nthree\nfour\nfive\n" "one\nTWO\nthree\nfour\nfive\n" == "CONFLICT") "delete versus edit still conflicts";
+  # an edit to the last line, and an append after it: touching
+  _ = check (merged False True "a\nb\nc\n" "a\nb\nC\n" "a\nb\nc\nd\n" == "CONFLICT") "edit last line + append, rules off";
+  _ = check (merged True True "a\nb\nc\n" "a\nb\nC\n" "a\nb\nc\nd\n" == "a\nb\nC\nd\n") "edit last line + append, rules on";
+  _ = check (merged True False "a\nb\nc\n" "X\na\nb\nc\n" "A\nb\nc\n" == "X\nA\nb\nc\n") "insert before a line the other edits";
+  # an insertion INSIDE what the other side replaced overlaps, rules or not
+  _ = check (merged True True "a\nb\nc\nd\n" "a\nb\nX\nc\nd\n" "a\nB\nC\nd\n" == "CONFLICT") "insert inside a replacement";
+  # where a conflict lies, in each version
+  hs = case T.merge3 False True (T.linesOf "a\nb\nc\nd\ne\n") (T.linesOf "a\nNEW\nb\nc\nD\ne\n") (T.linesOf "a\nb\nc\nd2\ne\n") of Err hs -> hs | Ok _ -> [];
+  _ = check (case hs of [T.Hunk i bs a os b ts] -> i == 3 and a == 4 and b == 3 and bs == ["d\n"] and os == ["D\n"] and ts == ["d2\n"] | _ -> False) "hunk positions follow earlier edits";
+  # no final newline on one side
+  _ = check (merged False True "a\nb" "a\nb\nc" "z\na\nb" == "z\na\nb\nc") "a last line without a newline";
+  _ = check (merged False True "a\nb\n" "a\nb\nc\n" "z\na\nb\n" == "z\na\nb\nc\n") "prepend and append";
+  _ = print "text diff and merge: PASS";
+  0.

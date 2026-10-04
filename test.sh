@@ -11,7 +11,10 @@ mkdir -p build
 QR_FAULT="$PWD/build/qr-fault" python3 tests/check.py
 "$FPR" build tests/merge.fpr --system=posix --harts 2 -o build/merge-test
 build/merge-test
+"$FPR" build tests/text.fpr --system=posix --harts 2 -o build/text-test
+build/text-test
 
 QR_FAULT="$PWD/build/qr-fault" python3 tests/remote.py
 QR_FAULT="$PWD/build/qr-fault" python3 tests/fixes.py
 QR_FAULT="$PWD/build/qr-fault" python3 tests/sync.py
+QR_FAULT="$PWD/build/qr-fault" python3 tests/textsync.py

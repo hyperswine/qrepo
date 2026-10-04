@@ -31,6 +31,11 @@ tested so far.
 ./qr --root /path/to/workspace restore v1 notes.txt --force
 ./qr --root /path/to/workspace ignore '.DS_Store'
 ./qr --root /path/to/workspace gc
+./qr --root /path/to/workspace config device laptop
+./qr --root /path/to/workspace config merge-rules on
+./qr --root /path/to/workspace sync --json
+./qr --root /path/to/workspace blame notes.txt
+./qr --root /path/to/workspace conflicts
 ./qr --root /path/to/workspace merge-json base.json left.json right.json
 ```
 
@@ -69,6 +74,10 @@ refused in any tree, local or remote: `.qrepo` under any casing, and
   checks, history, tags, ignores, guarded restores, and differences.
 - `merge.fpr`: recursive JSON three-way merge and a caller-supplied validator.
   Arrays/scalars are atomic. Missing keys and JSON null are distinct.
+- `text.fpr`: lines, a patience diff (unique-line anchors, then Myers' O(ND)
+  on what has none, in an arena), a three-way line merge with optional rules
+  for edits that only touch, and the line mapping blame follows. REMOTE.md
+  says how merges decide.
 - The remote is FP-RISC too: framing, the HTTP listener and the request
   workers are in `qr.fpr` over `std/tcp`, `std/stream` and `std/proc`. There
   is no network adapter in C. The client hands each request to `curl`, which
@@ -166,8 +175,10 @@ python3 tests/bench.py
 `tests/fixes.py` holds one regression per fault found in the review of
 2026-09-29: writes into `.qrepo` through another spelling, integers changed by
 a JSON merge, scans stopped by a symlink, transfers past 16 MiB, temporary
-files versioned, and directories and files trading places. `tests/sync.py`
-covers the documents-sync work of 2026-10-04: tokens, ignore patterns,
+files versioned, and directories and files trading places. `tests/text.fpr`
+and `tests/textsync.py` cover the line diff and merge, every conflict kind,
+`sync`'s states and blame; `tests/sync.py` covers the documents-sync work of
+2026-10-04: tokens, ignore patterns,
 collection, and 96 MiB through commit, status, clone and push with each
 command under 32 MiB resident.
 
