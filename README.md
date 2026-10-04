@@ -8,9 +8,10 @@ There is no Internet hosting, automatic commit, or named branch management.
 
 ## Build and use
 
-Requires the FP-RISC compiler (with `Proc.self` and exact JSON integers:
-fprisc after 2026-09-29) and a C toolchain. `build.sh` uses `$FPR`, then
-`../fprisc/fpr`, then `fpr` on PATH. macOS uses CommonCrypto; Linux/FreeBSD need
+Requires the FP-RISC compiler with 0-based string positions (fprisc from
+2026-10-02 on; an earlier compiler counts from 1, and a build with it misreads
+every object) and a C toolchain. `build.sh` uses `$FPR`, then `../fprisc/fpr`,
+then `fpr` on PATH. macOS uses CommonCrypto; Linux/FreeBSD need
 OpenSSL development headers/libraries (`libcrypto`). Only macOS arm64 has been
 executed and tested so far.
 

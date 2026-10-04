@@ -70,7 +70,7 @@ identity : String -> String -> String .
 identity kind body = sha (kind + "\n" + body).
 
 hexChar c = (c >= 48 and c <= 57) or (c >= 97 and c <= 102).
-validId id = strlen id == 64 and L.all hexChar (L.map (charAt id) (L.range 1 64)).
+validId id = strlen id == 64 and L.all hexChar (L.map (charAt id) (L.range 0 63)).
 
 load : String -> String -> String -> String .
 load root kind id =
@@ -78,7 +78,7 @@ load root kind id =
   raw = get root ("objects/" + id);
   prefix = kind + "\n";
   _ = check (S.startsWith prefix raw and sha raw == id) "object integrity failure";
-  substr raw (strlen prefix + 1) (strlen raw - strlen prefix).
+  substr raw (strlen prefix) (strlen raw - strlen prefix).
 
 save : String -> String -> String -> String -> Unit .
 save root kind body id =
@@ -106,9 +106,9 @@ snapshot root id = if id == "" then obj [] else
 # names publication gives its temporary files.
 reserved name = S.toLower name == ".qrepo" or S.startsWith ".qr-tmp-" name.
 validPath p = p != "" and not (S.startsWith "/" p) and L.all (fn x -> x != "" and x != "." and x != ".." and not (reserved x)) (S.split "/" p).
-digitsOnly t = t != "" and L.all (fn c -> c >= 48 and c <= 57) (L.map (charAt t) (L.range 1 (strlen t))).
+digitsOnly t = t != "" and L.all (fn c -> c >= 48 and c <= 57) (L.map (charAt t) (L.range 0 (strlen t - 1))).
 # ".qr-tmp-<pid>-<serial>", exactly as posix.c names them
-isTemp name = if not (S.startsWith ".qr-tmp-" name) then False else (case S.split "-" (substr name 9 (strlen name - 8)) of [a, b] -> digitsOnly a and digitsOnly b | _ -> False).
+isTemp name = if not (S.startsWith ".qr-tmp-" name) then False else (case S.split "-" (substr name 8 (strlen name - 8)) of [a, b] -> digitsOnly a and digitsOnly b | _ -> False).
 rules root = L.filter (fn x -> x != "" and not (S.startsWith "#" x)) (L.map S.trim (S.split "\n" (readPathOr "" (".qrepoignore")))).
 ruleMatches rule path = if S.endsWith "/" rule then S.startsWith rule (path + "/") else path == rule.
 ignored rs path = path == ".qrepo" or L.any (fn rule -> ruleMatches rule path) rs.
@@ -237,7 +237,7 @@ makeParents parts prefix = case parts of
 
 ignore : String -> String -> Unit .
 ignore root rule =
-  path = if S.endsWith "/" rule then substr rule 1 (strlen rule - 1) else rule;
+  path = if S.endsWith "/" rule then substr rule 0 (strlen rule - 1) else rule;
   _ = check (validPath path and not (S.startsWith "#" rule)) "ignore expects a root-relative path or directory/";
   before = readPathOr "" (".qrepoignore");
   writePath (".qrepoignore") (before + (if before == "" or S.endsWith "\n" before then "" else "\n") + rule + "\n").
@@ -276,11 +276,11 @@ message : List (String, J.Value) -> List String -> String .
 message header objects = strJoin "" (frame (encode (obj (L.append header [("objects", J.Integer (L.length objects))]))) :: L.map frame objects).
 # every frame of a byte string, in order
 frames : String -> Result (List String) String .
-frames raw = framesGo raw 1 [].
-framesGo raw i acc = if i > strlen raw then Ok (L.reverse acc) else
+frames raw = framesGo raw 0 [].
+framesGo raw i acc = if i >= strlen raw then Ok (L.reverse acc) else
   (case Bin.u32be i raw of
       O.None -> Err "truncated frame length"
-    | O.Some n -> if i + 3 + n > strlen raw then Err "truncated frame" else framesGo raw (i + 4 + n) (substr raw (i + 4) n :: acc)).
+    | O.Some n -> if i + 4 + n > strlen raw then Err "truncated frame" else framesGo raw (i + 4 + n) (substr raw (i + 4) n :: acc)).
 countOf : J.Value -> O.Option Int .
 countOf header = case J.field "objects" header of O.Some (J.Integer n) -> (if n >= 0 then O.Some n else O.None) | _ -> O.None.
 
@@ -293,7 +293,7 @@ readNGo conn n acc = if n == 0 then Ok (strJoin "" (L.reverse acc)) else
     | Ok bytes -> readNGo conn (n - strlen bytes) (bytes :: acc)).
 readFrame conn = case readN conn 4 of
     Err why -> Err why
-  | Ok len -> (case Bin.u32be 1 len of O.None -> Err "truncated frame length" | O.Some n -> readN conn n).
+  | Ok len -> (case Bin.u32be 0 len of O.None -> Err "truncated frame length" | O.Some n -> readN conn n).
 readFrames conn n acc = if n == 0 then Ok (L.reverse acc) else
   (case readFrame conn of Err why -> Err why | Ok body -> readFrames conn (n - 1) (body :: acc)).
 # a message from a connection: its header's text, and its objects
