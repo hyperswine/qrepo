@@ -1,0 +1,40 @@
+# /etc/nginx/sites-available/qrepo.cswine.cloud on the Linode.
+# TLS ends here; the hop to the mini is plain HTTP over the tailnet.
+# QRepo checks its own bearer token, so nginx only carries requests.
+# Before the 443 block exists, issue the certificate with the 80 block alone:
+#   certbot certonly --webroot -w /var/www/qrepo-acme -d qrepo.cswine.cloud
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name qrepo.cswine.cloud;
+    location /.well-known/acme-challenge/ { root /var/www/qrepo-acme; }
+    location / { return 301 https://$host$request_uri; }
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name qrepo.cswine.cloud;
+    ssl_certificate     /etc/letsencrypt/live/qrepo.cswine.cloud/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/qrepo.cswine.cloud/privkey.pem;
+
+    # QRepo answers one path; everything else stops here.
+    location = /qrepo {
+        proxy_pass http://100.107.153.43:7600;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+
+        # A transfer is as large as what is being synced: no cap here.
+        client_max_body_size 0;
+        # Stream both ways instead of spooling whole transfers on the Linode.
+        proxy_request_buffering off;
+        proxy_buffering off;
+        # Between two reads or writes, not for the whole transfer.  The mini
+        # verifies a push before it answers, which is seconds per GiB.
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+    location / { return 404; }
+}

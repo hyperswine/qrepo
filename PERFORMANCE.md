@@ -33,17 +33,49 @@ tests. QRepo uses function clauses to avoid that expansion. The compiler itself
 has not been patched, and the earlier Sol slowdown has not been remeasured with
 this rewrite. That is a separate, useful compiler follow-up.
 
+## Memory, 2026-10-04
+
+Same host, warm storage, one command each, peak resident set from
+`/usr/bin/time -l`. "Before" is the build of 2026-10-04 before streaming;
+clones are over loopback HTTP.
+
+| 200 files x 1 MiB (200 MB) | Before | After |
+|---|---:|---:|
+| First commit | 614 MB | 4 MB |
+| Clean status | 411 MB | 4 MB |
+| Clone | 1,053 MB | 5 MB |
+
+| 2,000 files x 2 KiB in 20 directories | Before | After |
+|---|---:|---:|
+| Clone | 189 MB | 30 MB |
+| `gc` (hashes every reachable object) | 54 MB | 10 MB |
+
+The listener stayed at 3 MB throughout. A 400 MB clone took 2.6 s and a
+200 MB push 1.6 s. `tests/sync.py` keeps 96 MiB through commit, status, clone
+and push under 32 MiB each.
+
+Why it was high: FP-RISC frees a heap only at an arena boundary or at exit,
+so every file body read, and every small per-file allocation, stayed until
+the command ended; and the history walk re-read every blob of the whole
+history, up to three times per pull. Now file bytes stay in `posix.c`, each
+file and each commit is processed in an arena of its own, and a blob is
+hashed once, when it enters the store (README, Safety). What remains grows
+with the number of paths and commits (trees, sets of identities), not with
+the bytes.
+
 ## Remaining costs
 
 - Scans read/hash the complete included working tree every time.
-- The scanner keeps file bodies in its results; Base allocation and JSON/tree
-  intermediates further increase memory use. This is not a bounded-memory or
-  streaming implementation, and large-repository memory scaling is unverified.
+- Trees are JSON parsed whole, and a command holds the sets of paths and
+  identities it works on: memory grows with the number of files and commits
+  (about 15 KB per path in a clone), not their size. Repositories of 100,000
+  paths are unmeasured.
 - Each new object is synchronized individually, favoring publication integrity
   over maximum commit throughput.
-- History loads and verifies every ancestor. No pagination or history index.
-- Objects live in a flat directory, without packing, sharding, or collection of
-  unreachable objects/temp files.
+- History is walked whole (each commit's tree is parsed once per walk); no
+  pagination or history index. Old versions are kept for as long as a commit
+  names them: `gc` removes only what nothing reaches.
+- Objects live in a flat directory, without packing or sharding.
 - Diff displays complete contents and can produce large output.
 - Linux/FreeBSD portability is source-level only; those hosts have not been run.
 

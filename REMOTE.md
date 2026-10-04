@@ -1,9 +1,10 @@
-# Experimental loopback remote
+# The remote
 
-QRepo now has a native Base/POSIX server and CLI synchronization commands.
-This is a local experiment, not an Internet-ready hosting service. It binds
-only to **127.0.0.1**, has no authentication or TLS, and serves one repository.
-The preserved Sol implementation is unchanged.
+QRepo has a native Base/POSIX server and CLI synchronization commands. The
+server speaks HTTP/1.1, checks a bearer token, and serves one repository. It
+has no TLS: past a private network, put it behind a proxy that terminates TLS
+(below: nginx on a public host, the server on a tailnet). The preserved Sol
+implementation is unchanged.
 
 ## Run it
 
@@ -24,17 +25,39 @@ Create an existing empty directory for each repository, then:
 ./qr --root /path/to/bob pull
 ```
 
+A remote is a port (`http://127.0.0.1:PORT`) or an `http://` or `https://`
+URL; requests go to `URL/qrepo`. `serve PORT` listens on 127.0.0.1;
+`serve PORT --address ADDRESS` listens elsewhere, and then **requires a
+token**:
+
+```sh
+./qr --root /path/to/server serve-token        # writes .qrepo/server-token, mode 0600
+./qr --root /path/to/server serve 7600 --address 100.107.153.43
+
+# each client takes the token on standard input, never as an argument
+ssh server cat /path/to/server/.qrepo/server-token |
+  ./qr --root /path/to/alice clone https://qrepo.example.com --token-stdin
+./qr --root /path/to/alice remote https://qrepo.example.com --token-stdin < token
+```
+
+Once a server has a token it requires it on loopback too. The client keeps it
+in `.qrepo/remote-token` (mode 0600) and hands it to curl in a header file.
+A repository configured before URLs (`remote.json` with only a port) still
+works, as `http://127.0.0.1:PORT`. A clone that fails after initializing
+leaves a repository with its remote configured: `pull` finishes it.
+
 The server treats its repository as an **object store and canonical HEAD**;
 accepted pushes do not update its working files. Inspect remote content using
 `show`, or use a clone. Do not edit/commit directly in the serving root while
 using it as the canonical store.
 
-`remote PORT` configures an existing repository. `fetch` imports and verifies
+`remote REMOTE` configures an existing repository. `fetch` imports and verifies
 remote objects and updates `REMOTE_HEAD`, without changing local HEAD or files.
 `pull` fetches and fast-forwards or merges. `push` transfers local history and
-requests an atomic, fast-forward HEAD update. Only localhost endpoints are
-supported. `status` compares against the **last observed** remote HEAD, not a
-live server query. Tags remain local and are not transferred.
+requests an atomic, fast-forward HEAD update. `status` compares against the
+**last observed** remote HEAD, not a live server query. Tags remain local and
+are not transferred. Nothing syncs on its own: each device commits, pushes
+and pulls when told.
 
 ## Concurrent edits and conflicts
 
@@ -97,37 +120,69 @@ termination was tested; physical power failure was not.
 
 ## Transport and implementation
 
-- `qr.fpr` implements all of it in FP-RISC: the protocol, framing, the
+- `qr.fpr` implements all of it in FP-RISC: the protocol, framing, the HTTP
   listener, the workers, validation, graph traversal, synchronization, merge,
-  and checkout recovery, over `std/tcp`, `std/stream` and `std/proc`.
-- **Protocol 2.** Each connection carries one request and one reply. A message
-  is frames, each a four-byte unsigned big-endian length and that many bytes:
-  a header (UTF-8 JSON, with `version: 2` and `objects`, how many follow),
-  then each object raw, as it is stored. An object carries no name: its
-  identity is its hash. Requests have an `op` of `head`, `fetch`, or `push`.
-  Version 1 (one JSON frame, objects in base64) is refused.
+  and checkout recovery, over `std/tcp`, `std/stream` and `std/proc`. The
+  client runs `curl` for each request, because std has no TLS.
+- **Protocol 3.** A request is one HTTP `POST /qrepo` whose body is a
+  message; the reply's body is another. A message is frames, each a four-byte
+  unsigned big-endian length and that many bytes: a header (UTF-8 JSON, with
+  `version: 3` and `objects`, how many follow), then each object raw, as it is
+  stored. An object carries no name: its identity is its hash. Requests have
+  an `op` of `head`, `fetch`, or `push`. Versions 1 and 2 (raw TCP) are
+  refused. Requests need `Content-Length`; chunked bodies are refused (411).
+- **Nothing holds a transfer in memory.** The client assembles a request in
+  `.qrepo/spool/client/` and curl uploads it from there (`-T`, which streams)
+  and writes the reply there. The listener writes a request body to
+  `.qrepo/spool/serve/` in 64 KiB pieces, the worker reads it and writes its
+  reply beside it, and the listener sends that back in pieces. Objects move
+  between those files and the store in `posix.c`; only headers are parsed in
+  FP-RISC. Each connection, and each piece, runs in an arena of its own.
 - **A transfer carries what the other side lacks.** A fetch says what the
   asker holds (`have`), a push leaves out what the server's head reaches. The
-  receiver verifies every hash and the whole graph before any reference moves,
-  so a sender that leaves out too much, or lies, changes nothing.
+  receiver hashes every object as it stores it and checks the whole graph
+  before any reference moves, so a sender that leaves out too much, or lies,
+  changes nothing.
 - Replies carry `version`, `ok`, and operation fields or an error. A request
-  that fails ends only its worker; the peer sees the connection close, the
-  listener goes on, and published HEAD is preserved.
+  whose worker fails gets `500` with the worker's message; the listener goes
+  on, and published HEAD is preserved. `401` is a missing or wrong token,
+  `404`/`405` is anything but `POST /qrepo`.
 - The listener handles one request at a time, each in a fresh process of the
-  same executable (`Proc.self`), with the request on its stdin, the reply on
-  its stdout and a twenty-second limit. What a request allocated goes with its
-  process. This is not yet an actor-based server: a failed `check` ends a
-  process, and an actor is not one.
-- Limits: a frame is as long as its length field can say (4 GiB less one);
-  five seconds of silence ends a read; twenty seconds ends a worker. A message
-  is held in memory whole on both sides, so a transfer is bounded by memory,
-  not by a number chosen here. No compression. No hostile peer
-  resource-exhaustion guarantee is claimed.
+  same executable (`Proc.self`). The worker has no time limit: it reads local
+  files, not the network. This is not yet an actor-based server: a failed
+  `check` ends a process, and an actor is not one.
+- Limits, and where they come from: a frame, so an object, is as long as its
+  length field can say (4 GiB less one). A request head is refused past
+  64 KiB (431); a proxy in front bounds it far lower. Thirty seconds of
+  silence from a peer ends its request on the server; on the client, curl
+  gives up on a connection after 20 s and on a transfer that moves nothing
+  for 300 s (a pushed transfer is silent while the server verifies it; the
+  nginx site allows the same). No compression. No hostile-peer resource-exhaustion guarantee is
+  claimed beyond those: the token and the proxy are what keep strangers out.
 - macOS arm64 is tested. `Proc.self` is implemented for Linux and FreeBSD and
   has not been run there.
 - If a push succeeds but its reply is lost, fetch before retrying. Server state
   may already have advanced. Unreachable objects from refused/interrupted
-  operations are retained; there is no garbage collector yet.
+  operations are retained until `gc`.
+
+## Behind nginx, over a tailnet
+
+The layout this was built for: a public host runs nginx with a Let's Encrypt
+certificate for the domain, is on the same tailnet as the machine that holds
+the repository, and forwards `/qrepo` to it. TLS ends at nginx; the hop over
+the tailnet is plain HTTP inside WireGuard; QRepo checks the token itself.
+
+- `deploy/qrepo.cswine.cloud.nginx`: the site. No body-size cap
+  (`client_max_body_size 0`), request and response buffering off so transfers
+  stream instead of spooling on the proxy, and five-minute read/send
+  timeouts, which apply between reads, not to a whole transfer. Everything
+  but `/qrepo` is a 404.
+- `deploy/cloud.cswine.qrepo.plist`: a LaunchAgent that runs
+  `qr serve 7600 --address <tailnet address>` and restarts it, including when
+  the tailnet is not up yet at login.
+
+The server's repository needs `init` and `serve-token` before the agent
+starts. Clients then `clone https://DOMAIN --token-stdin`.
 
 ## Reproduce the experiment
 

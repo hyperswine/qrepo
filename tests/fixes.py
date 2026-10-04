@@ -57,7 +57,7 @@ class Server:
 
 
 class Hostile:
-    """A peer that speaks protocol 2 and answers every request with these
+    """A peer that speaks protocol 3 and answers every request with these
     objects and this head, whatever they are: an honest server refuses to
     send a tree it would not accept, so the client's own refusal needs a liar."""
 
@@ -67,11 +67,13 @@ class Hostile:
         self.sock.bind(('127.0.0.1', 0))
         self.sock.listen(8)
         self.port = self.sock.getsockname()[1]
-        reply = frame(
+        body = frame(
             json.dumps(
-                dict(version=2, ok=True, head=head,
+                dict(version=3, ok=True, head=head,
                      objects=len(objects))).encode()) + b''.join(
                          frame(o) for o in objects)
+        reply = (b'HTTP/1.1 200 OK\r\nContent-Length: %d\r\n'
+                 b'Connection: close\r\n\r\n' % len(body)) + body
 
         def run():
             while True:
@@ -82,10 +84,16 @@ class Hostile:
                 with conn:
                     try:
                         conn.settimeout(5)
-                        n = struct.unpack('!I', conn.recv(4))[0]
-                        conn.recv(n)
+                        data = b''
+                        while b'\r\n\r\n' not in data:
+                            data += conn.recv(65536)
+                        head, _, rest = data.partition(b'\r\n\r\n')
+                        length = int(next(l.split(b':')[1] for l in head.split(b'\r\n')
+                                          if l.lower().startswith(b'content-length')))
+                        while len(rest) < length:
+                            rest += conn.recv(65536)
                         conn.sendall(reply)
-                    except OSError:
+                    except (OSError, StopIteration, ValueError):
                         pass
 
         threading.Thread(target=run, daemon=True).start()

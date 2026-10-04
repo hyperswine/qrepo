@@ -7,6 +7,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <sys/random.h>
+#include <signal.h>
 static int rootfd = -1, lockfd = -1;
 static unsigned long serial;
 /* The metadata directory, by IDENTITY.  A name is not enough: on a
@@ -137,28 +139,36 @@ static V makedir(V pv){char*name=NULL;int fd=parent(pv,&name);if(fd<0)return fai
   int r=mkdirat(fd,name,0700);if(r<0&&errno==EEXIST){int d=openat(fd,name,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);if(d>=0){close(d);r=0;}}
   if(!r)r=fsync(fd);V out=os_unit_or_errno(r);free(name);close(fd);return out;}
 FPR_FN_CSTACK(fpr_g_Qfs_x2emkdir,makedir,1);
-/* mode 1 creates an immutable object exclusively; mode 0 replaces a ref.
- * Write + fsync temp, publish, then fsync parent. Never truncate the target. */
-static V writefile(V pv,V bv,V mv){
+/* mode 1 creates an immutable object exclusively; mode 0 replaces a ref or a
+ * working file, keeping its permission bits.  `fill` writes the content into
+ * a temp in the destination directory; then fsync, publish, fsync the parent.
+ * Never truncate the target.  A fill that fails (a source that changed, an
+ * object that does not hash to its name) publishes nothing. */
+typedef int (*fill_fn)(int fd, void *ctx);
+static V publish(V pv, int mode, fill_fn fill, void *ctx){
   char*name=NULL;int dir=parent(pv,&name);if(dir<0)return failed();
   struct stat st;int sr=fstatat(dir,name,&st,AT_SYMLINK_NOFOLLOW);
   if(sr==0&&!S_ISREG(st.st_mode)){free(name);close(dir);return os_err("not a regular file");}
   if(sr<0&&errno!=ENOENT){V out=os_errno();free(name);close(dir);return out;}
-  if(sr==0&&UNTAG(mv)){free(name);close(dir);return os_err("object already exists");}
+  if(sr==0&&mode){free(name);close(dir);return os_err("object already exists");}
   char tmp[96];int fd;
   do{snprintf(tmp,sizeof tmp,".qr-tmp-%ld-%lu",(long)getpid(),++serial);fd=openat(dir,tmp,O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,0600);}while(fd<0&&errno==EEXIST);
   if(fd<0){V out=os_errno();free(name);close(dir);return out;}
-  str_t*b=(str_t*)bv;size_t at=0;int err=0;
-  while(at<b->len){ssize_t n=write(fd,b->bytes+at,b->len-at);if(n<0&&errno==EINTR)continue;if(n<=0){err=n<0?errno:EIO;break;}at+=n;}
+  refusal=NULL;
+  int err=fill(fd,ctx);
   if(!err&&sr==0&&fchmod(fd,st.st_mode&0777)<0)err=errno;
   if(!err&&fsync(fd)<0)err=errno;if(close(fd)<0&&!err)err=errno;
   if(!err)fault("before",pv);
-  if(!err){int r=UNTAG(mv)?linkat(dir,tmp,dir,name,0):renameat(dir,tmp,dir,name);if(r<0)err=errno;}
+  if(!err){int r=mode?linkat(dir,tmp,dir,name,0):renameat(dir,tmp,dir,name);if(r<0)err=errno;}
   if(!err)fault("after",pv);
   unlinkat(dir,tmp,0);
   if(!err&&fsync(dir)<0)err=errno;
-  free(name);close(dir);if(err){errno=err;return os_errno();}return os_ok((V)&fpr_unit);
+  free(name);close(dir);if(err){errno=err;return failed();}return os_ok((V)&fpr_unit);
 }
+static int writeall(int fd,const void*p,size_t n){const char*b=p;size_t at=0;
+  while(at<n){ssize_t k=write(fd,b+at,n-at);if(k<0&&errno==EINTR)continue;if(k<=0)return k<0?errno:EIO;at+=k;}return 0;}
+static int fill_bytes(int fd,void*ctx){str_t*b=ctx;return writeall(fd,b->bytes,b->len);}
+static V writefile(V pv,V bv,V mv){return publish(pv,(int)UNTAG(mv),fill_bytes,(void*)bv);}
 FPR_FN_CSTACK(fpr_g_Qfs_x2ewrite,writefile,3);
 
 /* Use the host's vetted SHA-256; never launch a hashing subprocess. */
@@ -184,6 +194,161 @@ FPR_FN_CSTACK(fpr_g_Qfs_x2esha256,sha256,1);
 static V output(V bv){str_t*b=(str_t*)bv;size_t at=0;while(at<b->len){ssize_t n=write(STDOUT_FILENO,b->bytes+at,b->len-at);if(n<0&&errno==EINTR)continue;if(n<=0)return os_errno();at+=n;}return os_ok((V)&fpr_unit);}
 FPR_FN_CSTACK(fpr_g_Qfs_x2eoutput,output,1);
 
+/* ---- Streaming: a file's bytes never enter the FP-RISC heap -------------
+ * The heap is reclaimed only at arena boundaries or exit, so a command that
+ * read every file it touched held all of them at once.  These move bytes
+ * between descriptors in 64 KiB pieces; what reaches FP-RISC is an identity,
+ * a size, or a few bytes of a frame header.  A span is (offset, length);
+ * length -1 means "to the end", and only then is the source required to be
+ * unchanged by size and timestamps, as Qfs.read requires. */
+#ifdef __APPLE__
+typedef CC_SHA256_CTX hctx;
+static int h_init(hctx*c){CC_SHA256_Init(c);return 1;}
+static void h_update(hctx*c,const void*p,size_t n){CC_SHA256_Update(c,p,(CC_LONG)n);}
+static void h_final(hctx*c,unsigned char*d){CC_SHA256_Final(d,c);}
+#else
+#include <openssl/evp.h>
+typedef struct { EVP_MD_CTX *m; } hctx;
+static int h_init(hctx*c){c->m=EVP_MD_CTX_new();return c->m&&EVP_DigestInit_ex(c->m,EVP_sha256(),NULL);}
+static void h_update(hctx*c,const void*p,size_t n){EVP_DigestUpdate(c->m,p,n);}
+static void h_final(hctx*c,unsigned char*d){unsigned int l;EVP_DigestFinal_ex(c->m,d,&l);EVP_MD_CTX_free(c->m);}
+#endif
+static void hexof(const unsigned char*d,char*hex){const char*digits="0123456789abcdef";
+  for(int i=0;i<32;i++){hex[2*i]=digits[d[i]>>4];hex[2*i+1]=digits[d[i]&15];}}
+static long long num(V v){if(!ISINT(v))fpr_cpanic("Qfs: expected an Int");return (long long)UNTAG(v);}
+
+/* a regular file, opened without following links */
+static int openreg(V pv,struct stat*st){
+  char*name=NULL;int dir=parent(pv,&name);if(dir<0)return -1;
+  int fd=openat(dir,name,O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);int e=errno;free(name);close(dir);
+  if(fd<0){errno=e;return -1;}
+  if(fstat(fd,st)<0||!S_ISREG(st->st_mode)){close(fd);errno=EINVAL;refusal="not a regular file";return -1;}
+  return fd;
+}
+static int same(int fd,const struct stat*before){struct stat after;
+  if(fstat(fd,&after)<0||before->st_size!=after.st_size)return 0;
+#ifdef __APPLE__
+  return before->st_mtimespec.tv_sec==after.st_mtimespec.tv_sec&&before->st_mtimespec.tv_nsec==after.st_mtimespec.tv_nsec&&before->st_ctimespec.tv_sec==after.st_ctimespec.tv_sec&&before->st_ctimespec.tv_nsec==after.st_ctimespec.tv_nsec;
+#else
+  return before->st_mtim.tv_sec==after.st_mtim.tv_sec&&before->st_mtim.tv_nsec==after.st_mtim.tv_nsec&&before->st_ctim.tv_sec==after.st_ctim.tv_sec&&before->st_ctim.tv_nsec==after.st_ctim.tv_nsec;
+#endif
+}
+/* Copy `len` bytes (-1: to the end) from `in` at its offset to `out` (-1:
+ * nowhere), hashing them into `c` (NULL: not).  0, or an errno. */
+static int pump(int in,long long len,int out,hctx*c){
+  unsigned char*buf=malloc(65536);if(!buf)return ENOMEM;int err=0;
+  while(len){size_t want=(len<0||len>65536)?65536:(size_t)len;
+    ssize_t n=read(in,buf,want);if(n<0&&errno==EINTR)continue;
+    if(n<0){err=errno;break;}
+    if(n==0){if(len>0){refusal="the source is shorter than its span";err=EIO;}break;}
+    if(c)h_update(c,buf,n);
+    if(out>=0&&(err=writeall(out,buf,n)))break;
+    if(len>0)len-=n;}
+  free(buf);return err;
+}
+/* open a source span: seek to `off`, and say whether it runs to the end */
+static int openspan(V pv,long long off,long long len,struct stat*st){
+  if(off<0||len<-1){errno=EINVAL;return -1;}
+  int fd=openreg(pv,st);if(fd<0)return -1;
+  if(off+(len<0?0:len)>st->st_size||lseek(fd,off,SEEK_SET)<0){close(fd);errno=EINVAL;refusal="span past the end of the file";return -1;}
+  return fd;
+}
+
+/* SHA-256 of prefix + the span: an object identity, computed in place. */
+static V hashspan(V pv,V offv,V lenv,V prefixv){
+  long long off=num(offv),len=num(lenv);struct stat st;
+  int fd=openspan(pv,off,len,&st);if(fd<0)return failed();
+  hctx c;if(!h_init(&c)){close(fd);return os_err("SHA-256 unavailable");}
+  str_t*pre=(str_t*)prefixv;h_update(&c,pre->bytes,pre->len);
+  int err=pump(fd,len,-1,&c);unsigned char d[32];h_final(&c,d);
+  if(!err&&len<0&&!same(fd,&st)){refusal="file changed while reading; retry";err=EIO;}
+  close(fd);if(err){errno=err;return failed();}
+  char hex[64];hexof(d,hex);return os_ok(os_str(hex,64));
+}
+FPR_FN_CSTACK(fpr_g_Qfs_x2ehash,hashspan,4);
+
+/* Publish prefix + a span as the immutable object `dst`, which it must hash
+ * to: the bytes are hashed as they are copied, so a source that changed
+ * after it was identified publishes nothing. */
+typedef struct { V src; long long off,len; str_t*prefix; str_t*id; } span_t;
+static int fill_span(int out,void*ctx){span_t*s=ctx;struct stat st;
+  int fd=openspan(s->src,s->off,s->len,&st);if(fd<0)return errno?errno:EIO;
+  hctx c;if(!h_init(&c)){close(fd);return EIO;}
+  h_update(&c,s->prefix->bytes,s->prefix->len);
+  int err=writeall(out,s->prefix->bytes,s->prefix->len);
+  if(!err)err=pump(fd,s->len,out,&c);
+  unsigned char d[32];h_final(&c,d);char hex[64];hexof(d,hex);
+  if(!err&&s->len<0&&!same(fd,&st)){refusal="file changed while reading; retry";err=EIO;}
+  if(!err&&(s->id->len!=64||memcmp(hex,s->id->bytes,64))){refusal="content changed since it was identified; retry";err=EIO;}
+  close(fd);return err;
+}
+static V storespan(V srcv,V offv,V lenv,V prefixv,V dstv,V idv){
+  span_t s={srcv,num(offv),num(lenv),(str_t*)prefixv,(str_t*)idv};
+  return publish(dstv,1,fill_span,&s);
+}
+FPR_FN_CSTACK(fpr_g_Qfs_x2estore,storespan,6);
+
+/* Replace working file `dst` with object `obj` less its first `skip` bytes
+ * (its kind line), checking the WHOLE object against `id` on the way. */
+typedef struct { V obj; long long skip; str_t*id; } extract_t;
+static int fill_extract(int out,void*ctx){extract_t*x=ctx;struct stat st;
+  int fd=openreg(x->obj,&st);if(fd<0)return errno?errno:EIO;
+  hctx c;if(!h_init(&c)){close(fd);return EIO;}
+  int err=pump(fd,x->skip,-1,&c);if(!err)err=pump(fd,-1,out,&c);
+  unsigned char d[32];h_final(&c,d);char hex[64];hexof(d,hex);
+  if(!err&&(x->id->len!=64||memcmp(hex,x->id->bytes,64))){refusal="object integrity failure";err=EIO;}
+  close(fd);return err;
+}
+static V extract(V objv,V dstv,V skipv,V idv){
+  extract_t x={objv,num(skipv),(str_t*)idv};
+  return publish(dstv,0,fill_extract,&x);
+}
+FPR_FN_CSTACK(fpr_g_Qfs_x2eextract,extract,4);
+
+/* A file from `off` to its end, to standard output. */
+static V emit(V pv,V offv){struct stat st;int fd=openspan(pv,num(offv),-1,&st);if(fd<0)return failed();
+  int err=pump(fd,-1,STDOUT_FILENO,NULL);close(fd);if(err){errno=err;return failed();}return os_ok((V)&fpr_unit);}
+FPR_FN_CSTACK(fpr_g_Qfs_x2eemit,emit,2);
+
+static V sizeof_(V pv){struct stat st;int fd=openreg(pv,&st);if(fd<0)return failed();close(fd);return os_ok(TAG((sw)st.st_size));}
+FPR_FN_CSTACK(fpr_g_Qfs_x2esize,sizeof_,1);
+
+/* exactly `len` bytes at `off`: a frame header, never a body */
+static V readat(V pv,V offv,V lenv){long long off=num(offv),len=num(lenv);struct stat st;
+  if(len<0){errno=EINVAL;return os_errno();}
+  int fd=openspan(pv,off,len,&st);if(fd<0)return failed();
+  char*b=malloc(len?len:1);if(!b){close(fd);return os_err("out of memory");}
+  long long at=0;int err=0;
+  while(at<len){ssize_t n=read(fd,b+at,len-at);if(n<0&&errno==EINTR)continue;if(n<=0){err=n<0?errno:EIO;break;}at+=n;}
+  close(fd);if(err){free(b);errno=err;return os_errno();}
+  V out=os_ok(os_str(b,len));free(b);return out;}
+FPR_FN_CSTACK(fpr_g_Qfs_x2ereadAt,readat,3);
+
+/* Scratch files (a transfer being assembled or received): appended, never
+ * synchronized, removed when the transfer ends. */
+static int openappend(V pv){char*name=NULL;int dir=parent(pv,&name);if(dir<0)return -1;
+  int fd=openat(dir,name,O_WRONLY|O_APPEND|O_CREAT|O_NOFOLLOW|O_CLOEXEC,0600);int e=errno;free(name);close(dir);errno=e;return fd;}
+static V appendb(V pv,V bv){int fd=openappend(pv);if(fd<0)return failed();str_t*b=(str_t*)bv;
+  int err=writeall(fd,b->bytes,b->len);if(close(fd)<0&&!err)err=errno;if(err){errno=err;return os_errno();}return os_ok((V)&fpr_unit);}
+FPR_FN_CSTACK(fpr_g_Qfs_x2eappend,appendb,2);
+/* a frame: the file's length as four big-endian bytes, then the file */
+static V appendframe(V dstv,V srcv){struct stat st;int in=openreg(srcv,&st);if(in<0)return failed();
+  if(st.st_size>0xffffffffLL){close(in);return os_err("an object of 4 GiB or more does not fit a frame");}
+  int out=openappend(dstv);if(out<0){V e=failed();close(in);return e;}
+  unsigned char h[4]={(unsigned char)(st.st_size>>24),(unsigned char)(st.st_size>>16),(unsigned char)(st.st_size>>8),(unsigned char)st.st_size};
+  int err=writeall(out,h,4);if(!err)err=pump(in,st.st_size,out,NULL);
+  if(!err&&!same(in,&st)){refusal="file changed while reading; retry";err=EIO;}
+  close(in);if(close(out)<0&&!err)err=errno;if(err){errno=err;return failed();}return os_ok((V)&fpr_unit);}
+FPR_FN_CSTACK(fpr_g_Qfs_x2eappendFrame,appendframe,2);
+
+/* n bytes from the host's entropy source, as hex: a bearer token */
+static V randomhex(V nv){long long n=num(nv);if(n<1||n>4096)return os_err("random: 1 to 4096 bytes");
+  unsigned char*b=malloc(n);char*hex=malloc(2*n);if(!b||!hex){free(b);free(hex);return os_err("out of memory");}
+  for(long long at=0;at<n;at+=256){size_t k=(n-at)>256?256:(size_t)(n-at);if(getentropy(b+at,k)<0){free(b);free(hex);return os_errno();}}
+  const char*digits="0123456789abcdef";for(long long i=0;i<n;i++){hex[2*i]=digits[b[i]>>4];hex[2*i+1]=digits[b[i]&15];}
+  V out=os_ok(os_str(hex,2*n));free(b);free(hex);return out;}
+FPR_FN_CSTACK(fpr_g_Qfs_x2erandom,randomhex,1);
+
 /* Remove a regular working file or completed checkout journal durably. */
 static V removefile(V pv){char *name=NULL;int fd=parent(pv,&name);if(fd<0)return failed();
   struct stat st;int r=fstatat(fd,name,&st,AT_SYMLINK_NOFOLLOW);
@@ -200,5 +365,9 @@ static V removedir(V pv){char *name=NULL;int fd=parent(pv,&name);if(fd<0)return 
 }
 FPR_FN_CSTACK(fpr_g_Qfs_x2ermdir,removedir,1);
 
-static V endrepo(V unit){(void)unit;if(lockfd>=0){close(lockfd);lockfd=-1;}if(rootfd>=0){close(rootfd);rootfd=-1;}return (V)&fpr_unit;}
+/* Release the repository lock, keeping the root open: the listener spools
+ * transfers under .qrepo while each request's worker takes the lock. */
+static V endrepo(V unit){(void)unit;if(lockfd>=0){close(lockfd);lockfd=-1;}
+  signal(SIGPIPE,SIG_IGN); /* a peer that hangs up is not the listener's death */
+  return (V)&fpr_unit;}
 FPR_FN_CSTACK(fpr_g_Qfs_x2eend,endrepo,1);

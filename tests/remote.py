@@ -25,36 +25,55 @@ def frame(data):
     return struct.pack('!I', len(data)) + data
 
 
-def rpc(port, body, objects=(), full=False):
-    """Protocol 2: a header frame (JSON, saying how many objects follow), then
-    each object raw.  Answers the reply's header, or (header, objects)."""
-    body = dict(body, objects=len(objects))
+def post(port, payload, headers=None, path='/qrepo', method='POST'):
+    """One HTTP request, written by hand so that a test can also send what a
+    real client would not.  Answers (status, body)."""
+    extra = ''.join(f'{k}: {v}\r\n' for k, v in (headers or {}).items())
     with socket.create_connection(('127.0.0.1', port), timeout=25) as s:
-        s.sendall(
-            frame(json.dumps(body).encode()) +
-            b''.join(frame(o) for o in objects))
+        s.sendall(f'{method} {path} HTTP/1.1\r\nHost: qrepo\r\n'
+                  f'Content-Length: {len(payload)}\r\n{extra}\r\n'.encode() +
+                  payload)
+        data = b''
+        while True:
+            v = s.recv(65536)
+            if not v: break
+            data += v
+    if not data: raise ConnectionError('the server closed the connection')
+    line, _, rest = data.partition(b'\r\n')
+    _, _, body = rest.partition(b'\r\n\r\n')
+    return int(line.split()[1]), body
 
-        def read(n):
-            out = b''
-            while len(out) < n:
-                v = s.recv(n - len(out))
-                if not v: raise ConnectionError('worker closed connection')
-                out += v
-            return out
 
-        def one():
-            return read(struct.unpack('!I', read(4))[0])
+def frames(body):
+    out, at = [], 0
+    while at < len(body):
+        n = struct.unpack('!I', body[at:at + 4])[0]
+        out.append(body[at + 4:at + 4 + n])
+        at += 4 + n
+    return out
 
-        header = json.loads(one())
-        got = [one() for _ in range(header.get('objects', 0))]
-        return (header, got) if full else header
+
+def rpc(port, body, objects=(), full=False, headers=None):
+    """Protocol 3: a header frame (JSON, saying how many objects follow), then
+    each object raw, as the body of a POST.  Answers the reply's header, or
+    (header, objects).  A request the server could not answer at all (its
+    worker failed) is a ConnectionError carrying the HTTP status."""
+    body = dict(body, objects=len(objects))
+    status, reply = post(
+        port,
+        frame(json.dumps(body).encode()) + b''.join(frame(o) for o in objects),
+        headers)
+    if status != 200: raise ConnectionError(f'HTTP {status}: {reply!r}')
+    parts = frames(reply)
+    header = json.loads(parts[0])
+    return (header, parts[1:]) if full else header
 
 
 def ready(port, proc):
     for _ in range(100):
         assert proc.poll() is None, 'server exited'
         try:
-            if rpc(port, dict(version=2, op='head'))['ok']: return
+            if rpc(port, dict(version=3, op='head'))['ok']: return
         except (OSError, ConnectionError):
             pass
         time.sleep(.05)
@@ -192,14 +211,14 @@ if __name__ == '__main__':
             before = head(server)
             answer = rpc(
                 port,
-                dict(version=2, op='push', expected='stale', head='0' * 64))
+                dict(version=3, op='push', expected='stale', head='0' * 64))
             assert not answer['ok']
             for objects in [[], [b'blob\nbad'],
                             [b'neither a blob nor a tree']]:
                 try:
                     answer = rpc(
                         port,
-                        dict(version=2,
+                        dict(version=3,
                              op='push',
                              expected=before,
                              head='0' * 64), objects)
@@ -230,7 +249,7 @@ if __name__ == '__main__':
                 try:
                     answer = rpc(
                         port,
-                        dict(version=2, op='push', expected=before, head=cid),
+                        dict(version=3, op='push', expected=before, head=cid),
                         [blob, tree, commit])
                 except ConnectionError:
                     pass
@@ -245,25 +264,39 @@ if __name__ == '__main__':
             refused(['sub/.Qrepo/x'])
             refused(['.qr-tmp-1-1'])
             refused(['a', 'a/b'])
-            # a header that promises objects which never arrive; a frame cut short
-            with socket.create_connection(('127.0.0.1', port)) as s:
-                s.sendall(
-                    frame(
-                        json.dumps(dict(version=2, op='head',
-                                        objects=3)).encode()))
-            with socket.create_connection(('127.0.0.1', port)) as s:
-                s.sendall(struct.pack('!I', 1 << 30) + b'short')
-            with socket.create_connection(('127.0.0.1', port)) as s:
-                s.sendall(frame(b'not json'))
-            assert rpc(port, dict(version=2, op='head'))['head'] == before
+            # a header that promises objects which never arrive; a frame cut
+            # short; a header that is not JSON: the worker fails, the
+            # listener answers 500 and goes on
+            for payload in [
+                    frame(json.dumps(dict(version=3, op='head', objects=3)).encode()),
+                    struct.pack('!I', 1 << 30) + b'short',
+                    frame(b'not json')]:
+                status, why = post(port, payload)
+                assert status == 500, (status, why)
+            # what is not a QRepo request at all
+            assert post(port, b'', path='/elsewhere')[0] == 404
+            assert post(port, b'', method='GET')[0] == 405
+            with socket.create_connection(('127.0.0.1', port), timeout=25) as s:
+                s.sendall(b'POST /qrepo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n')
+                assert s.recv(64).startswith(b'HTTP/1.1 411')
+            with socket.create_connection(('127.0.0.1', port), timeout=25) as s:
+                s.sendall(b'POST /qrepo HTTP/1.1\r\nX: ' + b'y' * 70000)
+                assert s.recv(64).startswith(b'HTTP/1.1 431')
+            # a body that stops short of its Content-Length, then a hang-up
+            with socket.create_connection(('127.0.0.1', port), timeout=25) as s:
+                s.sendall(b'POST /qrepo HTTP/1.1\r\nContent-Length: 1000\r\n\r\nshort')
+            assert rpc(port, dict(version=3, op='head'))['head'] == before
+            # one request at a time: the hang-up above was finished, and its spool emptied
+            assert not list((server / '.qrepo/spool/serve').iterdir())
             assert not rpc(port, dict(version=999, op='head'))['ok']
             assert not rpc(port, dict(version=1, op='head'))['ok']
+            assert not rpc(port, dict(version=2, op='head'))['ok']
             # a fetch carries what the asker lacks: with everything, nothing; with nothing, all of it
             header, everything = rpc(port,
-                                     dict(version=2, op='fetch', have=[]),
+                                     dict(version=3, op='fetch', have=[]),
                                      full=True)
             header, nothing = rpc(port,
-                                  dict(version=2, op='fetch', have=[before]),
+                                  dict(version=3, op='fetch', have=[before]),
                                   full=True)
             assert header['head'] == before and len(
                 everything) > 10 and nothing == [], (len(everything),
@@ -274,7 +307,7 @@ if __name__ == '__main__':
                 for o in everything)
             # what is not a commit, or not held, is no claim to have anything
             header, same = rpc(port,
-                               dict(version=2,
+                               dict(version=3,
                                     op='fetch',
                                     have=['f' * 64, 'not an id', 7]),
                                full=True)
@@ -291,7 +324,7 @@ if __name__ == '__main__':
                 stderr=log,
                 start_new_session=True)
             ready(port, proc)
-            assert rpc(port, dict(version=2, op='head'))['head'] == before
+            assert rpc(port, dict(version=3, op='head'))['head'] == before
             print('Server restart preserves published history: PASS',
                   flush=True)
         finally:

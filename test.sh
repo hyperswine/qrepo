@@ -14,3 +14,4 @@ build/merge-test
 
 QR_FAULT="$PWD/build/qr-fault" python3 tests/remote.py
 QR_FAULT="$PWD/build/qr-fault" python3 tests/fixes.py
+QR_FAULT="$PWD/build/qr-fault" python3 tests/sync.py
