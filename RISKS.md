@@ -75,6 +75,11 @@ each Mac). Written 2026-10-04; each entry says what was done about it.
 - Held changes hold pulls too: a device stays behind until they are settled.
 - UTF-16 text has NUL bytes and is binary: it never merges. A change of line
   endings changes every line.
+- **The mini's network is everyone's.** On 2026-10-04 the mini dropped off
+  the tailnet for about an hour (it stayed up; restarting the router brought
+  it back), and qrepo, pos and qchat answered 504 meanwhile. Nothing is
+  lost (devices keep working and sync when it returns), but nothing
+  watches for it either: no alert, no restart of the network side.
 - The mini is the only server. Every clone holds all history and is a
   reasonable backup, but tags, and what was never pushed, live only where
   they were made.
@@ -86,5 +91,5 @@ each Mac). Written 2026-10-04; each entry says what was done about it.
 | 1 | certbot deploy hook for qrepo | **done**: `/etc/letsencrypt/renewal-hooks/deploy/qrepo-nginx.sh`, run by hand (nginx reloaded) and a renewal dry run passed. **pos, qchat and vpply have the same gap** (no installer, no hook); today another site's renewal happens to reload nginx before they expire. |
 | 2 | Tailscale key expiry off for the Linode and the mini | pending: the admin console needs the owner signed in |
 | 5 | default `.qrepoignore` | **done**: `qr init` writes `default.qrepoignore`; an empty repository pulling takes the remote's rules over it; the live store has it (commit `3e7fa05f`) |
-| 6 | history-bounded sync | **done**: generation numbers and verified marks (README, History at scale) |
+| 6 | history-bounded sync | **done**: generation numbers and verified marks (README, History at scale); the mini runs it since 2026-10-04 (previous build kept as `~/qrepo/qr.prev`) |
 | 12 | machine-scoped extension settings | **done**: `qrepo.path` and `qrepo.device` are `machine` settings (extension 0.1.1) |
