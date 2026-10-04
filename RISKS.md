@@ -88,8 +88,8 @@ each Mac). Written 2026-10-04; each entry says what was done about it.
 
 | # | What | State |
 |---|---|---|
-| 1 | certbot deploy hook for qrepo | **done**: `/etc/letsencrypt/renewal-hooks/deploy/qrepo-nginx.sh`, run by hand (nginx reloaded) and a renewal dry run passed. **pos, qchat and vpply have the same gap** (no installer, no hook); today another site's renewal happens to reload nginx before they expire. |
-| 2 | Tailscale key expiry off for the Linode and the mini | pending: the admin console needs the owner signed in |
+| 1 | certbot deploy hook for qrepo | **done**: `/etc/letsencrypt/renewal-hooks/deploy/qrepo-nginx.sh`, run by hand (nginx reloaded) and a renewal dry run passed. pos, qchat and vpply had the same gap (no installer, no hook): each has its own hook since 2026-10-04, `pos-nginx.sh`, `qchat-nginx.sh`, `vpply-nginx.sh`. |
+| 2 | Tailscale key expiry off for the Linode and the mini | **done** (by the owner, 2026-10-04): off for all four machines, confirmed through the Tailscale API. The API key in `.env.local` (git-ignored, mode 600) expires itself, at most 90 days after it was made. |
 | 5 | default `.qrepoignore` | **done**: `qr init` writes `default.qrepoignore`; an empty repository pulling takes the remote's rules over it; the live store has it (commit `3e7fa05f`) |
 | 6 | history-bounded sync | **done**: generation numbers and verified marks (README, History at scale); the mini runs it since 2026-10-04 (previous build kept as `~/qrepo/qr.prev`) |
 | 12 | machine-scoped extension settings | **done**: `qrepo.path` and `qrepo.device` are `machine` settings (extension 0.1.1) |
