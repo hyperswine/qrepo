@@ -638,19 +638,31 @@ rpcOp root _ request inPath objects = (refusal "unknown operation", []).
 loopback address = address == "127.0.0.1" or address == "::1" or address == "localhost".
 serverToken root = S.trim (readPathOr "" (meta root "server-token")).
 serveDir root = meta root "spool/serve".
+# The server's log lines carry the time (UTC), and its current step is kept
+# in .qrepo/serve-state, overwritten at each step.  A server that stops --
+# killed, or halted by the runtime -- leaves its last step there, and the
+# next start reports it, so a stop is placed: idle between requests, or
+# inside one, and which part.  Writing the step never stops the server.
+logLine text = Sys.stderr "{Clock.iso (Clock.now Unit)} {text}\n".
+serveState root text = case Qfs.write (meta root "serve-state") "{Clock.iso (Clock.now Unit)} {text}\n" 0 of _ -> Unit.
 listenOn root address port =
   exe = need (Proc.self Unit);
   token = serverToken root;
   _ = check (token != "" or loopback address) "serving on {address} needs a token: run `qr serve-token` first";
+  previous = S.trim (readPathOr "" (meta root "serve-state"));
+  _ = (if previous == "" then Unit else logLine "the previous run's last step: {previous}");
   _ = clearSpool root (serveDir root);
   listener = need (Tcp.listen address port);
   access = if token == "" then "no token" else "token required";
-  _ = Sys.stderr "QRepo listening on {address}:{port} (HTTP, one request at a time, {access})\n";
+  _ = logLine "QRepo listening on {address}:{port} (HTTP, one request at a time, {access})";
   serveLoop exe root token listener 0.
 # each connection in its own arena: what it allocated goes when it ends
-serveLoop exe root token listener n = case Tcp.accept listener of
+serveLoop exe root token listener n =
+  _ = serveState root "accepting (request {n} next)";
+  case Tcp.accept listener of
     Err why -> Program.fail 1 ("the listener stopped: " + why)
   | Ok (conn, peer) ->
+      _ = serveState root "reading request {n} from {peer}";
       _ = Sys.arena (fn u -> serveOne exe root token conn n);
       _ = ST.close conn;
       serveLoop exe root token listener (n + 1).
@@ -687,14 +699,20 @@ exchange exe root conn rest len n =
   inPath = serveDir root + "/in-" + tag;
   outPath = serveDir root + "/out-" + tag;
   _ = need (Qfs.append inPath rest);
+  _ = serveState root "receiving request {n}'s body ({len} bytes)";
   got = receiveBody conn inPath (len - strlen rest);
   _ = (if got == 2 then reply conn 507 "the server could not store the request" else
     if got != 0 then Unit else
-    (case Proc.spawn (Proc.describe [exe, "--root", root, "__rpc", inPath, outPath]) of
-        Err why -> reply conn 500 ("the worker did not start: " + why)
-      | Ok done -> if done.status == 0 then sendFile conn outPath else reply conn 500 (if done.err == "" then "the request failed" else S.trim done.err)));
+    runWorker exe root conn inPath outPath n);
   _ = removeIf inPath;
   removeIf outPath.
+runWorker exe root conn inPath outPath n =
+  _ = serveState root "running the worker for request {n}";
+  case Proc.spawn (Proc.describe [exe, "--root", root, "__rpc", inPath, outPath]) of
+      Err why -> reply conn 500 ("the worker did not start: " + why)
+    | Ok done ->
+        _ = serveState root "replying to request {n}";
+        if done.status == 0 then sendFile conn outPath else reply conn 500 (if done.err == "" then "the request failed" else S.trim done.err).
 # the rest of a body into its spool file, a piece at a time, each piece in an
 # arena of its own: 0 done, 1 the peer stalled or went, 2 the store failed
 receiveBody conn path remaining = if remaining <= 0 then 0 else

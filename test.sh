@@ -2,7 +2,9 @@
 set -eu
 cd "$(dirname "$0")"
 if [ -z "${FPR:-}" ]; then
-  if [ -x ../fprisc/fpr ]; then FPR=../fprisc/fpr; else FPR=fpr; fi
+  if [ -x deps/fprisc/fpr ]; then FPR=$PWD/deps/fprisc/fpr
+  elif [ -x ../fprisc/fpr ]; then FPR=../fprisc/fpr
+  else FPR=fpr; fi
 fi
 export FPR
 ./build.sh
