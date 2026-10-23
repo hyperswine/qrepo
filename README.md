@@ -5,7 +5,7 @@ experiment is preserved separately in `../qrepo-sol`; it is not required to
 build or run this version. This is still a prototype. A remote over HTTP, with
 a bearer token, supports clone/fetch/pull/push and conservative merging, and is
 meant to sit behind a TLS proxy for anything past a private network; see
-[REMOTE.md](REMOTE.md). There is no automatic commit, background sync, or named
+[2026-09-29-REMOTE.md](docs/2026-09-29-REMOTE.md). There is no automatic commit, background sync, or named
 branch management.
 
 ## Build and use
@@ -76,7 +76,7 @@ refused in any tree, local or remote: `.qrepo` under any casing, and
   Arrays/scalars are atomic. Missing keys and JSON null are distinct.
 - `text.fpr`: lines, a patience diff (unique-line anchors, then Myers' O(ND)
   on what has none, in an arena), a three-way line merge with optional rules
-  for edits that only touch, and the line mapping blame follows. REMOTE.md
+  for edits that only touch, and the line mapping blame follows. docs/2026-09-29-REMOTE.md
   says how merges decide.
 - The remote is FP-RISC too: framing, the HTTP listener and the request
   workers are in `qr.fpr` over `std/tcp`, `std/stream` and `std/proc`. There
@@ -103,7 +103,7 @@ refused in any tree, local or remote: `.qrepo` under any casing, and
 arena boundary or at exit, so a command that read the files it touched held
 all of them at once: a 200 MB clone peaked near 1 GB. File bytes now stay in
 `posix.c`, and per-file and per-commit work runs in an arena of its own; what
-remains grows with the number of paths, not their size (PERFORMANCE.md).
+remains grows with the number of paths, not their size (docs/2026-09-29-PERFORMANCE.md).
 
 The application declares `unsafe base.` and builds with `--system=posix`.
 This permits unbounded operations and host effects; type and linearity checks
@@ -131,7 +131,7 @@ and deleted files are rebuilt. `gc` checks every reachable object whole, as
 before, and rewrites the marks. What a mark does not cover any more is an
 object lost from disk below a verified commit after it was checked: `gc`
 finds that, a sync does not. With 1,500 commits of 500 files, an idle sync
-went from 7.0 s to 0.06 s (PERFORMANCE.md).
+went from 7.0 s to 0.06 s (docs/2026-09-29-PERFORMANCE.md).
 
 ## Format 2
 
@@ -217,5 +217,5 @@ commands, corruption, JSON conflicts, and validator refusal. A separately built
 test-only binary injects process death immediately before/after HEAD publication.
 The release binary contains no enabled fault-injection environment switch.
 
-See `PERFORMANCE.md` for local measurements and remaining scaling limits, and
-`REMOTE.md` for the remote protocol, commands, recovery behavior, and experiment.
+See `docs/2026-09-29-PERFORMANCE.md` for local measurements and remaining scaling limits, and
+`docs/2026-09-29-REMOTE.md` for the remote protocol, commands, recovery behavior, and experiment.

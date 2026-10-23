@@ -630,7 +630,7 @@ rpcOp root _ request inPath objects = (refusal "unknown operation", []).
 # It listens where it is told, 127.0.0.1 unless --address says otherwise.
 # Anything but loopback needs a token (qr serve-token): a bearer token,
 # compared by hash.  There is no TLS here: for anything past a private
-# network, put the server behind a proxy that terminates it (REMOTE.md).
+# network, put the server behind a proxy that terminates it (docs/2026-09-29-REMOTE.md).
 # A request's head is read whole and is refused past 64 KiB -- a proxy in
 # front bounds it far lower (nginx: 4 x 8 KiB); its body goes to a spool file
 # in pieces and is as long as Content-Length says.  Thirty seconds of
