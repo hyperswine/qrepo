@@ -4,6 +4,7 @@ const assert = require('node:assert');
 const { classify, heldKey } = require('../lib/policy');
 const { describeHunk, describeFile, narrow } = require('../lib/words');
 const hover = require('../lib/hover');
+const { Controller } = require('../lib/controller');
 
 const M = (path, added, removed, lines, text = true) => ({ path, change: 'M', text, added, removed, lines });
 
@@ -52,4 +53,48 @@ test('hover: where a line came from, and the other side of a conflict', () => {
   assert.strictEqual(hover.conflictAt(record, 'todo.txt', 4), null);
   assert.strictEqual(hover.conflictAt(record, 'other.txt', 3), null);
   assert.match(hover.markdown(null, hover.conflictAt(record, 'todo.txt', 3), record), /laptop's version:\n```\n- 6 eggs\n```/);
+});
+
+// a qr that answers from a script and records what it was asked
+function fakeQr(status, calls) {
+  return {
+    status: async () => { calls.push('status'); return { value: status() }; },
+    sync: async () => { calls.push('sync'); return { value: { state: 'synced' } }; },
+    conflicts: async () => { calls.push('conflicts'); return { value: { local: 'l', remote: 'r', files: [] } }; },
+  };
+}
+const quietUi = { setState() {}, announceHeld() {}, announceConflict() {}, reviewHeld() {}, compare() {}, error() {} };
+
+test('flush on closing: saved edits go out; nothing changed, paused or held sends nothing', async () => {
+  const edits = [M('notes.txt', 2, 0, 19)];
+  let calls = [];
+  const c = new Controller('/r', { qr: fakeQr(() => ({ changes: edits, conflicts: false }), calls), ui: quietUi });
+  assert.strictEqual(await c.flush(), 'synced');
+  assert.deepStrictEqual(calls, ['status', 'status', 'sync']);
+
+  calls = [];
+  const idle = new Controller('/r', { qr: fakeQr(() => ({ changes: [], conflicts: false }), calls), ui: quietUi });
+  assert.strictEqual(await idle.flush(), 'nothing');
+  assert.deepStrictEqual(calls, ['status']);
+
+  calls = [];
+  const paused = new Controller('/r', { qr: fakeQr(() => ({ changes: edits, conflicts: false }), calls), ui: quietUi });
+  paused.paused = true;
+  assert.strictEqual(await paused.flush(), 'paused');
+  assert.deepStrictEqual(calls, []);
+
+  // a held deletion is not pushed through on the way out
+  calls = [];
+  const held = new Controller('/r', { qr: fakeQr(() => ({ changes: [{ path: 'old.txt', change: 'D', text: true, added: 0, removed: 9, lines: 9 }], conflicts: false }), calls), ui: quietUi });
+  assert.strictEqual(await held.flush(), 'held');
+  assert.ok(!calls.includes('sync'));
+
+  // a tick already running is waited for, not doubled
+  calls = [];
+  const busy = new Controller('/r', { qr: fakeQr(() => ({ changes: edits, conflicts: false }), calls), ui: quietUi });
+  const first = busy.tick();
+  const flushed = busy.flush();
+  await first;
+  assert.strictEqual(await flushed, 'synced');
+  assert.deepStrictEqual(calls, ['status', 'sync', 'status', 'status', 'sync']);
 });

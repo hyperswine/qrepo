@@ -2,7 +2,7 @@
   "name": "qrepo",
   "displayName": "QRepo",
   "description": "Syncs a qrepo workspace on its own, holds unusual changes, settles conflicts with you, and shows where each line came from.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "jasen",
   "license": "UNLICENSED",
   "repository": { "type": "git", "url": "https://github.com/hyperswine/qrepo" },

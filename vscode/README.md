@@ -6,7 +6,9 @@ extension starts by itself. It does four things:
 - **Syncs on its own.** A save, then `qrepo.idleDelay` seconds of quiet, and
   every `qrepo.syncInterval` seconds besides: `qr sync`, which commits what
   changed (`auto: todo.txt +3 -1`), pulls, merges and pushes. Nothing runs
-  while a file in the folder has unsaved edits.
+  while a file in the folder has unsaved edits. Closing the window (or
+  removing the folder from it) syncs anything saved since the last sync,
+  waiting at most four seconds; a push cut short is sent on the next sync.
 - **Holds unusual changes.** A deleted file, or a text file that lost most
   of its lines (`qrepo.hold.*`), would reach every other device on the next
   sync, so nothing syncs until you say so: *Sync anyway*, or *Review*

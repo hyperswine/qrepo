@@ -1,7 +1,7 @@
 'use strict';
 // Inside VS Code (run by test/run-vscode.js): the extension activates on the
 // qrepo workspace, syncs a save, explains a line on hover, shows a revision,
-// and settles a conflict by command.
+// settles a conflict by command, and syncs a last save when it is closed.
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
@@ -95,6 +95,21 @@ async function run() {
   await vscode.commands.executeCommand('qrepo.syncAnyway');
   await until('the delete to sync', () => c.state.kind === 'synced' && serverHead() !== held);
   log('a delete is held until "sync anyway"');
+
+  // closing right after a save: deactivate syncs it (the debounce dies with
+  // the window).  Last, since deactivate stops every loop.
+  const late = serverHead();
+  const e3 = new vscode.WorkspaceEdit();
+  e3.insert(uri, new vscode.Position(0, 0), '# saved just before closing\n');
+  await vscode.workspace.applyEdit(e3);
+  await doc.save();
+  const started = Date.now();
+  await require(path.join(ext.extensionPath, 'extension.js')).deactivate();
+  assert.notStrictEqual(serverHead(), late, 'the last save reached the server on close');
+  assert.ok(Date.now() - started < 4500, 'closing waited at most the flush limit');
+  qr(OTHER, 'pull');
+  assert.ok(fs.readFileSync(path.join(OTHER, 'todo.txt'), 'utf8').startsWith('# saved just before closing\n'));
+  log('a save made just before closing is synced on close');
 }
 
 module.exports = { run };

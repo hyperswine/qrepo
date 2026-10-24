@@ -186,7 +186,8 @@ function stop(root) {
 }
 function refreshRoots() {
   const want = new Set((vscode.workspace.workspaceFolders || []).map((f) => f.uri.fsPath).filter(isRoot));
-  for (const root of [...controllers.keys()]) if (!want.has(root)) stop(root);
+  // a folder taken out of the workspace: its saved edits still go out
+  for (const root of [...controllers.keys()]) if (!want.has(root)) { const c = controllers.get(root).controller; stop(root); c.flush().catch(() => {}); }
   for (const root of want) if (!controllers.has(root)) start(root);
   render();
 }
@@ -249,8 +250,15 @@ function activate(context) {
   return { controllers }; // for tests
 }
 
+// Closing the window: stop the loops, then sync what was saved since the last
+// sync.  VS Code waits a few seconds for this; past FLUSH_MS it is left to the
+// next open.  qr commits before it pushes, so a push cut short loses nothing.
+const FLUSH_MS = 4000;
 function deactivate() {
+  const pending = [...controllers.values()].map((e) => e.controller);
   for (const r of [...controllers.keys()]) stop(r);
+  const flushes = Promise.all(pending.map((c) => c.flush().catch(() => 'error')));
+  return Promise.race([flushes, new Promise((r) => setTimeout(r, FLUSH_MS))]);
 }
 
 module.exports = { activate, deactivate };

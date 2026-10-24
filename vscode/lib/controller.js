@@ -150,6 +150,21 @@ class Controller {
     return this.tick(true);
   }
 
+  // The window is closing: sync what is saved and not yet synced, once.
+  // Without this, an edit saved just before closing waited for the next time
+  // the folder was opened (the debounce and the interval die with the window).
+  // Nothing changed: nothing is sent.  Paused, held changes and conflicts stay
+  // as they are -- they wait for the person.  Answers the state it ended in.
+  async flush() {
+    if (this.paused) return 'paused';
+    await this.idle();
+    const st = await this.qr.status();
+    if (!st.value) return 'error';
+    if (!st.value.conflicts && !(st.value.changes || []).length) return 'nothing';
+    await this.tick();
+    return this.state.kind;
+  }
+
   pause(on) {
     this.paused = on;
     this.set(on ? { kind: 'paused' } : { kind: 'idle' });
