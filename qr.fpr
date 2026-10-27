@@ -10,6 +10,8 @@ T = use "text".
 Encoding = use "std/encoding".
 Tcp = use "std/tcp".
 ST = use "std/stream".
+PL = use "std/poller".
+Net = use "std/osnet".
 Proc = use "std/proc".
 Bin = use "std/binary".
 
@@ -653,19 +655,40 @@ listenOn root address port =
   _ = (if previous == "" then Unit else logLine "the previous run's last step: {previous}");
   _ = clearSpool root (serveDir root);
   listener = need (Tcp.listen address port);
+  poller = PL.start Unit;
   access = if token == "" then "no token" else "token required";
   _ = logLine "QRepo listening on {address}:{port} (HTTP, one request at a time, {access})";
-  serveLoop exe root token listener 0.
+  serveLoop exe root token listener poller 0.
 # each connection in its own arena: what it allocated goes when it ends
-serveLoop exe root token listener n =
+serveLoop exe root token listener poller n =
   _ = serveState root "accepting (request {n} next)";
-  case Tcp.accept listener of
+  case nextConnection listener poller of
     Err why -> Program.fail 1 ("the listener stopped: " + why)
   | Ok (conn, peer) ->
       _ = serveState root "reading request {n} from {peer}";
       _ = Sys.arena (fn u -> serveOne exe root token conn n);
       _ = ST.close conn;
-      serveLoop exe root token listener (n + 1).
+      serveLoop exe root token listener poller (n + 1).
+# The next connection, waited for on the Poller (std/poller): the wait is a
+# host thread blocked in poll(2), and this actor sleeps in its mailbox.
+# Tcp.accept would poll the listener and sleep 4 ms between looks, which kept
+# an idle server waking 250 times a second -- and an idle server so busy is
+# what a runtime bug catches after hours (fprisc docs/2026-10-28-IDLE-
+# DEADLOCK.md).  A readiness that is gone by the time of the accept (a
+# client that gave up) waits again; a passing shortage is logged and waited
+# out, as std/tcp does.
+nextConnection listener poller = case listener of Tcp.Listener f ->
+  (case PL.awaitResult f poller of
+      Err why -> Err why
+    | Ok _ -> (case Net.accept f of
+          Ok (c, peer) -> Ok (ST.Stream c, peer)
+        | Err why ->
+            if why == "again" then nextConnection listener poller else
+            if S.startsWith "busy: " why then
+              _ = logLine "accept: {substr why 6 (strlen why - 6)} (still serving)";
+              _ = Sys.sleepUs 20000;
+              nextConnection listener poller
+            else Err why)).
 serveOne exe root token conn n = case readHead conn "" of
     Err "too large" -> reply conn 431 "the request head is larger than 64 KiB"
   | Err _ -> Unit
