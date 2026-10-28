@@ -4,7 +4,7 @@
   "description": "Syncs a qrepo workspace on its own, holds unusual changes, settles conflicts with you, and shows where each line came from.",
   "version": "0.1.2",
   "publisher": "jasen",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "repository": { "type": "git", "url": "https://github.com/hyperswine/qrepo" },
   "engines": { "vscode": "^1.75.0" },
   "categories": ["Other", "SCM Providers"],
