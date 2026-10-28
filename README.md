@@ -8,6 +8,21 @@ meant to sit behind a TLS proxy for anything past a private network; see
 [2026-09-29-REMOTE.md](docs/2026-09-29-REMOTE.md). There is no automatic commit, background sync, or named
 branch management.
 
+## Quickstart (Linux)
+
+Checked on Debian trixie x86-64 with fprisc main (efce2f6) built in a sibling `../fprisc`
+(see fprisc's README: `make fpr`), plus the OpenSSL headers:
+
+```sh
+sudo apt-get install gcc libssl-dev curl python3
+./build.sh                                   # builds ./qr
+mkdir -p /tmp/ws && echo hi > /tmp/ws/notes.txt
+./qr --root /tmp/ws init
+./qr --root /tmp/ws commit "first checkpoint"
+./qr --root /tmp/ws history
+./test.sh                                    # full suite (about 2 minutes)
+```
+
 ## Build and use
 
 Requires the FP-RISC compiler with 0-based string positions (fprisc from
@@ -15,8 +30,8 @@ Requires the FP-RISC compiler with 0-based string positions (fprisc from
 every object) and a C toolchain. `build.sh` uses `$FPR`, then `../fprisc/fpr`,
 then `fpr` on PATH. macOS uses CommonCrypto; Linux/FreeBSD need
 OpenSSL development headers/libraries (`libcrypto`). The remote's client
-commands run `curl` (std has no TLS). Only macOS arm64 has been executed and
-tested so far.
+commands run `curl` (std has no TLS). macOS arm64 and Linux x86-64 (Debian trixie)
+have been executed and tested.
 
 ```sh
 ./build.sh
