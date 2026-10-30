@@ -10,3 +10,4 @@ section inside it, and add new pages to the end of the table.
 | 2026-09-29 | [PERFORMANCE](2026-09-29-PERFORMANCE.md) | native QRepo performance checkpoint: local measurements and remaining scaling limits |
 | 2026-09-29 | [REMOTE](2026-09-29-REMOTE.md) | the remote: the native server, sync commands, protocol and recovery behaviour |
 | 2026-10-04 | [RISKS](2026-10-04-RISKS.md) | what could go wrong with QRepo as a documents sync service |
+| 2026-10-31 | [QSTORE](2026-10-31-QSTORE.md) | proposal: qstore, chunked and compressed storage and resumable transfer of large blobs, with history's ids unchanged |
