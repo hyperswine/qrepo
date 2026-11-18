@@ -64,20 +64,24 @@ gaps xs ys anchors acc = case anchors of
       xl = L.takeWhile (fn p -> case p of (i, _) -> i < ai) xs;
       yl = L.takeWhile (fn p -> case p of (j, _) -> j < aj) ys;
       gaps (L.drop (L.length xl + 1) xs) (L.drop (L.length yl + 1) ys) rest ((ai, aj) :: diffGo xl yl acc)).
-# the longest subsequence of (i, j) pairs, i rising as given, whose j rise too
+# the longest subsequence of (i, j) pairs, i rising as given, whose j rise too.
+# The piles' tops are a linear Vector (written in place, std Vec): pile `at`
+# is its row, the binary search reads rows, and a new pile is a push.
 lis pairs =
-  (tails, back, n) = L.fold (fn st p -> case st of (tails, back, n) -> (case p of (i, j) ->
-      at = place tails j 0 n;
-      prev = if at == 0 then O.None else M.get (at - 1) tails;
-      (M.insert at (i, j) tails, M.insert i prev back, if at == n then n + 1 else n)))
-    (M.empty Ord.int, M.empty Ord.int, 0) pairs;
-  (case M.get (n - 1) tails of O.None -> [] | O.Some last -> chain back (O.Some last) []).
-# the first pile whose top j is not below `j` (binary search over 0..n)
-place tails j lo hi = if lo >= hi then lo else
+  (tails, back, n) = L.fold (fn st p -> lisStep st p) (Vec.new Unit, M.empty Ord.int, 0) pairs;
+  (last, t2) = if n == 0 then ((0, 0), tails) else Vec.get (n - 1) tails;
+  _ = Vec.free t2;
+  if n == 0 then [] else chain back (O.Some last) [].
+lisStep st p = case st of (tails, back, n) -> (case p of (i, j) ->
+  (at, t1) = place tails j 0 n;
+  (prev, t2) = (if at == 0 then (O.None, t1) else (case Vec.get (at - 1) t1 of (q, t3) -> (O.Some q, t3)));
+  t4 = (if at == n then Vec.push (i, j) t2 else Vec.set at (i, j) t2);
+  (t4, M.insert i prev back, if at == n then n + 1 else n)).
+# the first pile whose top j is not below `j` (binary search over lo..hi)
+place tails j lo hi = if lo >= hi then (lo, tails) else
   mid = (lo + hi) / 2;
-  (case M.get mid tails of
-      O.Some (_, mj) -> if mj < j then place tails j (mid + 1) hi else place tails j lo mid
-    | O.None -> lo).
+  (case Vec.get mid tails of
+      ((_, mj), t1) -> if mj < j then place t1 j (mid + 1) hi else place t1 j lo mid).
 chain back cur acc = case cur of
     O.None -> acc
   | O.Some (i, j) -> chain back (M.getOr O.None i back) ((i, j) :: acc).
