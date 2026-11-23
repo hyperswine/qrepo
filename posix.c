@@ -88,7 +88,7 @@ static V begin(V rv, V initv) {
   struct stat ms; if(fstat(meta,&ms)<0){close(meta);return os_errno();} metadev=ms.st_dev; metaino=ms.st_ino;
   if(flock(lockfd,LOCK_EX)<0){close(meta);return os_errno();}
   if(UNTAG(initv) && (fsync(meta)<0 || fsync(rootfd)<0)){close(meta);return os_errno();}
-  close(meta);return os_ok((V)&fpr_unit);
+  close(meta);return os_ok(V_UNIT);
 }
 FPR_FN_CSTACK(fpr_g_Qfs_x2ebegin,begin,2);
 static V kind(V pv){
@@ -130,7 +130,7 @@ static V list(V pv){
     if(!utf8((unsigned char*)de->d_name,strlen(de->d_name))){err=EILSEQ;break;}
     if(n==cap){size_t nc=cap?cap*2:64;char**p=realloc(names,nc*sizeof *names);if(!p){err=ENOMEM;break;}names=p;cap=nc;}
     names[n]=strdup(de->d_name);if(!names[n]){err=ENOMEM;break;}n++;}
-  closedir(d);if(n>1)qsort(names,n,sizeof *names,cmp);V out=(V)&os_nil;
+  closedir(d);if(n>1)qsort(names,n,sizeof *names,cmp);V out=V_NIL;
   for(size_t i=n;i-->0;){if(!err)out=os_cons(os_str(names[i],strlen(names[i])),out);free(names[i]);}free(names);
   if(err){errno=err;return os_errno();}return os_ok(out);
 }
@@ -163,7 +163,7 @@ static V publish(V pv, int mode, fill_fn fill, void *ctx){
   if(!err)fault("after",pv);
   unlinkat(dir,tmp,0);
   if(!err&&fsync(dir)<0)err=errno;
-  free(name);close(dir);if(err){errno=err;return failed();}return os_ok((V)&fpr_unit);
+  free(name);close(dir);if(err){errno=err;return failed();}return os_ok(V_UNIT);
 }
 static int writeall(int fd,const void*p,size_t n){const char*b=p;size_t at=0;
   while(at<n){ssize_t k=write(fd,b+at,n-at);if(k<0&&errno==EINTR)continue;if(k<=0)return k<0?errno:EIO;at+=k;}return 0;}
@@ -191,7 +191,7 @@ static V sha256(V bv){
   return os_str(hex,64);
 }
 FPR_FN_CSTACK(fpr_g_Qfs_x2esha256,sha256,1);
-static V output(V bv){str_t*b=(str_t*)bv;size_t at=0;while(at<b->len){ssize_t n=write(STDOUT_FILENO,b->bytes+at,b->len-at);if(n<0&&errno==EINTR)continue;if(n<=0)return os_errno();at+=n;}return os_ok((V)&fpr_unit);}
+static V output(V bv){str_t*b=(str_t*)bv;size_t at=0;while(at<b->len){ssize_t n=write(STDOUT_FILENO,b->bytes+at,b->len-at);if(n<0&&errno==EINTR)continue;if(n<=0)return os_errno();at+=n;}return os_ok(V_UNIT);}
 FPR_FN_CSTACK(fpr_g_Qfs_x2eoutput,output,1);
 
 /* ---- Streaming: a file's bytes never enter the FP-RISC heap -------------
@@ -307,7 +307,7 @@ FPR_FN_CSTACK(fpr_g_Qfs_x2eextract,extract,4);
 
 /* A file from `off` to its end, to standard output. */
 static V emit(V pv,V offv){struct stat st;int fd=openspan(pv,num(offv),-1,&st);if(fd<0)return failed();
-  int err=pump(fd,-1,STDOUT_FILENO,NULL);close(fd);if(err){errno=err;return failed();}return os_ok((V)&fpr_unit);}
+  int err=pump(fd,-1,STDOUT_FILENO,NULL);close(fd);if(err){errno=err;return failed();}return os_ok(V_UNIT);}
 FPR_FN_CSTACK(fpr_g_Qfs_x2eemit,emit,2);
 
 static V sizeof_(V pv){struct stat st;int fd=openreg(pv,&st);if(fd<0)return failed();close(fd);return os_ok(TAG((sw)st.st_size));}
@@ -329,7 +329,7 @@ FPR_FN_CSTACK(fpr_g_Qfs_x2ereadAt,readat,3);
 static int openappend(V pv){char*name=NULL;int dir=parent(pv,&name);if(dir<0)return -1;
   int fd=openat(dir,name,O_WRONLY|O_APPEND|O_CREAT|O_NOFOLLOW|O_CLOEXEC,0600);int e=errno;free(name);close(dir);errno=e;return fd;}
 static V appendb(V pv,V bv){int fd=openappend(pv);if(fd<0)return failed();str_t*b=(str_t*)bv;
-  int err=writeall(fd,b->bytes,b->len);if(close(fd)<0&&!err)err=errno;if(err){errno=err;return os_errno();}return os_ok((V)&fpr_unit);}
+  int err=writeall(fd,b->bytes,b->len);if(close(fd)<0&&!err)err=errno;if(err){errno=err;return os_errno();}return os_ok(V_UNIT);}
 FPR_FN_CSTACK(fpr_g_Qfs_x2eappend,appendb,2);
 /* a frame: the file's length as four big-endian bytes, then the file */
 static V appendframe(V dstv,V srcv){struct stat st;int in=openreg(srcv,&st);if(in<0)return failed();
@@ -338,7 +338,7 @@ static V appendframe(V dstv,V srcv){struct stat st;int in=openreg(srcv,&st);if(i
   unsigned char h[4]={(unsigned char)(st.st_size>>24),(unsigned char)(st.st_size>>16),(unsigned char)(st.st_size>>8),(unsigned char)st.st_size};
   int err=writeall(out,h,4);if(!err)err=pump(in,st.st_size,out,NULL);
   if(!err&&!same(in,&st)){refusal="file changed while reading; retry";err=EIO;}
-  close(in);if(close(out)<0&&!err)err=errno;if(err){errno=err;return failed();}return os_ok((V)&fpr_unit);}
+  close(in);if(close(out)<0&&!err)err=errno;if(err){errno=err;return failed();}return os_ok(V_UNIT);}
 FPR_FN_CSTACK(fpr_g_Qfs_x2eappendFrame,appendframe,2);
 
 /* n bytes from the host's entropy source, as hex: a bearer token */
@@ -369,5 +369,5 @@ FPR_FN_CSTACK(fpr_g_Qfs_x2ermdir,removedir,1);
  * transfers under .qrepo while each request's worker takes the lock. */
 static V endrepo(V unit){(void)unit;if(lockfd>=0){close(lockfd);lockfd=-1;}
   signal(SIGPIPE,SIG_IGN); /* a peer that hangs up is not the listener's death */
-  return (V)&fpr_unit;}
+  return V_UNIT;}
 FPR_FN_CSTACK(fpr_g_Qfs_x2eend,endrepo,1);

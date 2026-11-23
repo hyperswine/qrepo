@@ -1,6 +1,5 @@
 # Conservative three-way JSON policy. Arrays and scalars are atomic.
 # Missing keys are Options, distinct from a JSON null value.
-Set = use "std/set".
 J = use "std/json".
 M = use "std/map".
 O = use "std/option".
@@ -27,7 +26,7 @@ slot path base left right =
     | _ -> Err ("conflict at " + path).
 mergeObjects : String -> M.Map String J.Value -> M.Map String J.Value -> M.Map String J.Value -> Result (O.Option J.Value) String .
 mergeObjects path b l r =
-  ks = Set.toList (Set.fromList Ord.string (L.concat [M.keys b, M.keys l, M.keys r]));
+  ks = M.keys (M.fromList Ord.string (L.map (fn k -> (k, Unit)) (L.concat [M.keys b, M.keys l, M.keys r])));
   case mergeKeys path b l r ks [] of
     Ok entries -> Ok (O.Some (J.object entries))
   | Err e -> Err e.
