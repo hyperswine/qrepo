@@ -3,7 +3,6 @@ unsafe base.
 
 Program = use "std/program".
 Clock = use "std/clock".
-Set = use "std/set".
 Merge = use "merge".
 T = use "text".
 
@@ -53,6 +52,11 @@ L = use "std/list".
 M = use "std/map".
 O = use "std/option".
 Ord = use "std/order".
+# string sets are Maps to Unit (std/set is retired in the v1.0 spec)
+keySet : List String -> M.Map String Unit .
+keySet xs = M.fromList Ord.string (L.map (fn x -> (x, Unit)) xs).
+withKeys : List String -> M.Map String Unit -> M.Map String Unit .
+withKeys xs s = M.insertAll (L.map (fn x -> (x, Unit)) xs) s.
 
 need r = case r of Ok x -> x | Err e -> Program.fail 1 e.
 check b e = if b then Unit else Program.fail 1 e.
@@ -203,7 +207,7 @@ key (k, v) = k.
 tree : List (String, String) -> J.Value .
 tree files = obj (L.map entry files).
 keys : J.Value -> J.Value -> List String .
-keys a b = Set.toList (Set.fromList Ord.string (L.append (L.map key (pairs a)) (L.map key (pairs b)))).
+keys a b = M.keys (keySet (L.append (L.map key (pairs a)) (L.map key (pairs b)))).
 
 changes : J.Value -> J.Value -> List String .
 changes a b = L.filter (fn p -> field p a != field p b) (keys a b).
@@ -459,11 +463,11 @@ checkPrefixes parts prefix state = case parts of
 # here it need only be present and a blob.  `deep` hashes every blob again
 # (gc, before it removes anything).
 graph root deep todo seen objects = case todo of
-    [] -> Set.toList objects
-  | id :: rest -> if Set.member id seen then graph root deep rest seen objects else
+    [] -> M.keys objects
+  | id :: rest -> if M.member id seen then graph root deep rest seen objects else
       # one commit in an arena: out come its parents, its tree, and the blobs not seen before
       (ps, treeId, fresh) = Sys.arena (fn u -> commitStep root deep id objects);
-      graph root deep (L.append ps rest) (Set.insert id seen) (Set.insertAll (id :: treeId :: fresh) objects).
+      graph root deep (L.append ps rest) (M.insert id Unit seen) (withKeys (id :: treeId :: fresh) objects).
 commitStep root deep id objects =
   rec = record root id;
   ps = parents rec;
@@ -471,7 +475,7 @@ commitStep root deep id objects =
   treeId = text (field "root_state" rec);
   state = parse (load root "tree" treeId);
   _ = validateState state;
-  fresh = L.filter (fn bid -> not (Set.member bid objects)) (L.map (fn item -> case item of (_, v) -> text v) (pairs state));
+  fresh = L.filter (fn bid -> not (M.member bid objects)) (L.map (fn item -> case item of (_, v) -> text v) (pairs state));
   _ = each (fn bid -> if deep then verifyObject root "blob" bid else presentObject root "blob" bid) fresh;
   (ps, treeId, fresh).
 # an id this store holds as a commit
@@ -484,8 +488,8 @@ pack root tip haves = if tip == "" then [] else
   known = isCommit root;
   hs = L.filter known haves;
   fresh = newCommits root tip hs;
-  held = Set.fromList Ord.string (L.concat (L.map (fn h -> Sys.arena (fn u -> treeObjects root h)) hs));
-  L.filter (fn id -> not (Set.member id held)) (Set.toList (Set.fromList Ord.string
+  held = keySet (L.concat (L.map (fn h -> Sys.arena (fn u -> treeObjects root h)) hs));
+  L.filter (fn id -> not (M.member id held)) (M.keys (keySet
     (L.concat (L.map (fn c -> c :: Sys.arena (fn u -> treeObjects root c)) fresh)))).
 # a commit's tree and the blobs it names
 treeObjects root c = rec = record root c; treeId = text (field "root_state" rec);
@@ -544,12 +548,12 @@ parentsIn g id = case M.get id g of O.Some (_, ps) -> ps | O.None -> [].
 isAncestor root older newer = if older == "" or older == newer then True else if newer == "" then False else
   g = withGens root (loadGraph root) [older, newer];
   floor = genIn g older;
-  reachDown g older floor [newer] Set.strings.
+  reachDown g older floor [newer] M.strings.
 reachDown g target floor todo seen = case todo of
     [] -> False
   | id :: rest -> if id == target then True else
-      if Set.member id seen or genIn g id <= floor then reachDown g target floor rest seen
-      else reachDown g target floor (L.append (parentsIn g id) rest) (Set.insert id seen).
+      if M.member id seen or genIn g id <= floor then reachDown g target floor rest seen
+      else reachDown g target floor (L.append (parentsIn g id) rest) (M.insert id Unit seen).
 
 # Two walks at once, newest generation first, each commit carrying flags for
 # which side reaches it.  A queue is a list kept in descending generation.
@@ -584,23 +588,23 @@ basesGo g q acc = if L.all (fn e -> case e of (_, _, f) -> band f 4 != 0) q then
 
 # A commit made here, every file of it just stored, whose parents are all
 # verified (or that has none) is complete as it stands: mark it so.
-markMade root id ps = if L.all (fn p -> Set.member p (loadMarks root)) ps then need (Qfs.append (meta root "verified") (cacheLine [id])) else Unit.
-loadMarks root = Set.fromList Ord.string (L.concat (L.map (fn f -> case f of [id] -> [id] | _ -> []) (cacheEntries root "verified"))).
+markMade root id ps = if L.all (fn p -> M.member p (loadMarks root)) ps then need (Qfs.append (meta root "verified") (cacheLine [id])) else Unit.
+loadMarks root = keySet (L.concat (L.map (fn f -> case f of [id] -> [id] | _ -> []) (cacheEntries root "verified"))).
 # that a commit's whole history is here and sound, checking only what no
 # verified commit already covers
 verified root tip = if tip == "" then Unit else
   marks = loadMarks root;
-  if Set.member tip marks then Unit else
-    _ = verifyWalk root [tip] marks Set.strings Set.strings;
+  if M.member tip marks then Unit else
+    _ = verifyWalk root [tip] marks M.strings M.strings;
     need (Qfs.append (meta root "verified") (cacheLine [tip])).
 verifyWalk root todo marks seen objects = case todo of
     [] -> Unit
-  | id :: rest -> if Set.member id seen or Set.member id marks then verifyWalk root rest marks (Set.insert id seen) objects else
+  | id :: rest -> if M.member id seen or M.member id marks then verifyWalk root rest marks (M.insert id Unit seen) objects else
       # what verified parents hold needs no check again
-      known = L.concat (L.map (fn p -> if Set.member p marks then Sys.arena (fn u -> treeObjects root p) else []) (parents (record root id)));
-      objects2 = Set.insertAll known objects;
+      known = L.concat (L.map (fn p -> if M.member p marks then Sys.arena (fn u -> treeObjects root p) else []) (parents (record root id)));
+      objects2 = withKeys known objects;
       (ps, treeId, fresh) = Sys.arena (fn u -> commitStep root False id objects2);
-      verifyWalk root (L.append ps rest) marks (Set.insert id seen) (Set.insertAll (id :: treeId :: fresh) objects2).
+      verifyWalk root (L.append ps rest) marks (M.insert id Unit seen) (withKeys (id :: treeId :: fresh) objects2).
 
 # The worker: ONE request from a spool file, its reply into another, then
 # exit.  The listener runs a fresh one per request, so a request that fails --
@@ -955,7 +959,7 @@ conflictOf path kind why hunks = obj [("path", J.Text path), ("kind", J.Text kin
 side at lines = obj [("line", J.Integer at), ("text", J.Sequence (L.map J.Text lines))].
 hunkJson h = case h of T.Hunk i bs a os b ts -> obj [("base", side i bs), ("ours", side a os), ("theirs", side b ts)].
 mergeStates root rules oursFirst base left right =
-  results = L.map (fn p -> (p, mergeValue root rules oursFirst p (field p base) (field p left) (field p right))) (Set.toList (Set.fromList Ord.string (L.concat [keys base left, keys base right])));
+  results = L.map (fn p -> (p, mergeValue root rules oursFirst p (field p base) (field p left) (field p right))) (M.keys (keySet (L.concat [keys base left, keys base right])));
   conflicts = L.concat (L.map (fn item -> case item of (_, Err c) -> [c] | _ -> []) results);
   kept = L.concat (L.map (fn item -> case item of (p, Ok v) -> (if v == J.Null then [] else [(p, v)]) | _ -> []) results);
   (obj kept, conflicts).
@@ -1041,16 +1045,16 @@ finishMerge root message =
   remote = text (field "remote" rec);
   _ = check (head root == local) "HEAD moved since the conflict was recorded: sync again";
   _ = verified root remote;
-  conflicted = Set.fromList Ord.string (conflictedPaths rec);
+  conflicted = keySet (conflictedPaths rec);
   (merged, _) = mergeStates root (rulesOn root) False (snapshot root (text (field "base" rec))) (snapshot root local) (snapshot root remote);
   files = scan root;
   now = tree files;
-  others = L.filter (fn p -> not (Set.member p conflicted)) (changes (snapshot root local) now);
+  others = L.filter (fn p -> not (M.member p conflicted)) (changes (snapshot root local) now);
   _ = check (L.isEmpty others) ("changed outside the conflicting files: " + S.join ", " others + " (commit-merge settles only the conflict)");
-  final = obj (L.append (L.filter (fn item -> case item of (p, _) -> not (Set.member p conflicted)) (pairs merged))
-                        (L.concat (L.map (fn p -> case field p now of J.Null -> [] | v -> [(p, v)]) (Set.toList conflicted))));
+  final = obj (L.append (L.filter (fn item -> case item of (p, _) -> not (M.member p conflicted)) (pairs merged))
+                        (L.concat (L.map (fn p -> case field p now of J.Null -> [] | v -> [(p, v)]) (M.keys conflicted))));
   _ = validateState final;
-  _ = each (fn item -> case item of (p, key) -> if Set.member p conflicted then storeFile root p key else Unit) files;
+  _ = each (fn item -> case item of (p, key) -> if M.member p conflicted then storeFile root p key else Unit) files;
   body = encode final;
   sid = identity "tree" body;
   commitBody = encode (obj [("root_state", J.Text sid), ("parents", J.Sequence [J.Text local, J.Text remote]), ("author", J.Text (device root)), ("timestamp", J.Integer (Clock.now Unit)), ("message", J.Text message), ("metadata", obj [])]);
@@ -1165,13 +1169,13 @@ blameFile root path json =
   owners = M.fromList Ord.int (if blobId == "" then [] else blameWalk root path tip blobId pending []);
   perLine = L.map (fn k -> M.getOr "" k owners) (L.range 0 (L.length lines - 1));
   if json then
-    used = Set.toList (Set.fromList Ord.string (L.filter (fn c -> c != "") perLine));
+    used = M.keys (keySet (L.filter (fn c -> c != "") perLine));
     info = fn c -> rec = record root c; (c, obj [("author", field "author" rec), ("timestamp", field "timestamp" rec), ("message", field "message" rec)]);
     print (encode (obj [("path", J.Text path), ("head", J.Text tip), ("lines", J.Integer (L.length lines)),
       ("ranges", J.Sequence (L.map (fn r -> case r of (a, b, c) -> obj [("start", J.Integer a), ("end", J.Integer b), ("commit", orNull c)]) (runs perLine 0 []))),
       ("commits", obj (L.map info used))]))
   else
-    authors = M.fromList Ord.string (L.map (fn c -> (c, text (field "author" (record root c)))) (Set.toList (Set.fromList Ord.string (L.filter (fn c -> c != "") perLine))));
+    authors = M.fromList Ord.string (L.map (fn c -> (c, text (field "author" (record root c)))) (M.keys (keySet (L.filter (fn c -> c != "") perLine))));
     _ = L.map (fn pair -> case pair of (c, line) ->
       print ((if c == "" then "uncommitted        " else substr c 0 8 + " " + S.padRight 10 " " (M.getOr "" c authors)) + " | " + (if S.endsWith "\n" line then substr line 0 (strlen line - 1) else line))) (L.zip perLine lines);
     Unit.
@@ -1206,13 +1210,13 @@ gc root =
   tagIds = L.map (fn item -> case item of (_, v) -> text v) (pairs (parse (get root "tags.json")));
   journal = if exists (meta root "checkout.json") then (case parse (get root "checkout.json") of j -> [text (field "before" j), text (field "target" j)]) else [];
   roots = L.filter validId (L.concat [[head root, S.trim (readPathOr "" (meta root "REMOTE_HEAD"))], tagIds, journal]);
-  live = Set.fromList Ord.string (graph root True roots Set.strings Set.strings);
-  dead = L.filter (fn name -> not (Set.member name live)) (ls (meta root "objects"));
+  live = keySet (graph root True roots M.strings M.strings);
+  dead = L.filter (fn name -> not (M.member name live)) (ls (meta root "objects"));
   bytes = L.sum (L.map (fn name -> need (Qfs.size (meta root ("objects/" + name)))) dead);
   _ = each (fn name -> need (Qfs.remove (meta root ("objects/" + name)))) dead;
   # the verified marks: what was just checked deeply, and only what is kept
-  _ = put root "verified" (strJoin "" (L.map (fn c -> cacheLine [c]) (L.filter (fn c -> Set.member c live) (L.append (Set.toList (loadMarks root)) roots))));
-  print "removed {L.length dead} unreachable objects ({bytes} bytes); kept {Set.size live}".
+  _ = put root "verified" (strJoin "" (L.map (fn c -> cacheLine [c]) (L.filter (fn c -> M.member c live) (L.append (M.keys (loadMarks root)) roots))));
+  print "removed {L.length dead} unreachable objects ({bytes} bytes); kept {M.size live}".
 
 commands = "init|status [--json]|commit MESSAGE|history [--json]|diff|tag NAME|show REV PATH|restore REV PATH [--force]|ignore PATTERN|gc|config [device NAME|merge-rules on|off]|sync [--json]|blame PATH [--json]|conflicts [--json]|resolve PATH ours|theirs|both|merge-json BASE LEFT RIGHT|serve PORT [--address ADDRESS]|serve-token|clone REMOTE [--token-stdin]|remote REMOTE [--token-stdin]|fetch|pull|push|commit-merge MESSAGE|recover".
 usage u = Program.fail 2 ("usage: qr [--root DIRECTORY] " + commands).
