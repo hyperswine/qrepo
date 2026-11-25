@@ -10,7 +10,7 @@ Encoding = use "std/encoding".
 Tcp = use "std/tcp".
 ST = use "std/stream".
 PL = use "std/poller".
-Net = use "std/osnet".
+Net = use "std/os".
 Proc = use "std/proc".
 Bin = use "std/binary".
 
