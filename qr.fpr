@@ -11,6 +11,7 @@ PL = use "std/poller".
 Net = use "std/os".
 Proc = use "std/proc".
 Bin = use "std/binary".
+Glob = use "std/glob".
 J = use "std/json".
 S = use "std/string".
 L = use "std/list".
@@ -92,11 +93,7 @@ sha bytes = Qfs.sha256 bytes.
 identity : String -> String -> String .
 identity kind body = sha (kind + "\n" + body).
 
-allChars pred s = allCharsGo pred s 0 (strlen s).
-allCharsGo : (Int -> Bool) -> String -> Int -> (rem : Int | measure rem) -> Bool .
-allCharsGo pred s i rem =
-  if rem <= 0 then True
-  else pred (charAt s i) and allCharsGo pred s (i + 1) (rem - 1).
+allChars = S.allChars.
 
 hexChar c = (c >= 48 and c <= 57) or (c >= 97 and c <= 102).
 validId id = strlen id == 64 and allChars hexChar id.
@@ -177,51 +174,9 @@ isTemp name = case S.split "-" (substr name 8 (strlen name - 8)) of
     [a, b] -> digitsOnly a and digitsOnly b
   | _ -> False.
 
-rules _ =
-  readPathOr "" ".qrepoignore"
-  |> S.split "\n"
-  |> L.map S.trim
-  |> L.filter (fn x -> x != "" and not (S.startsWith "#" x)).
-
-# An ignore rule is a pattern of path components.  In a component, `*`
-# matches any run of bytes and `?` one byte; nothing else is special.  A rule
-# with no "/" but a trailing one names a component at ANY depth (".DS_Store",
-# "*.tmp", "build/"); one with a "/" inside, or a leading "/", is anchored at
-# the root ("docs/draft.md", "/notes.txt", "docs/*.bak").  A rule that
-# matches a directory matches everything below it, and the scan does not
-# descend into it.  A trailing "/" is accepted and changes nothing else.
-glob pat name = globGo pat 0 name 0.
-globGo pat i name j =
-  if i == strlen pat then j == strlen name
-  else
-    c = charAt pat i;
-    if c == 42 then globGo pat (i + 1) name j or (j < strlen name and globGo pat i name (j + 1))
-    else j < strlen name and (c == 63 or c == charAt name j) and globGo pat (i + 1) name (j + 1).
-
-ruleParts rule =
-  bare = if S.endsWith "/" rule then substr rule 0 (strlen rule - 1) else rule;
-  anchored = S.startsWith "/" bare or S.contains "/" bare;
-  trimmed = if S.startsWith "/" bare then substr bare 1 (strlen bare - 1) else bare;
-  (anchored, S.split "/" trimmed).
-
-prefixMatch : (pats : List String | measure pats) -> List String -> Bool .
-prefixMatch pats comps = case pats of
-    [] -> True
-  | p :: ps -> case comps of
-      [] -> False
-    | c :: cs -> glob p c and prefixMatch ps cs.
-
-ruleMatches rule path =
-  (anchored, pats) = ruleParts rule;
-  comps = S.split "/" path;
-  if anchored then prefixMatch pats comps
-  else case pats of [one] -> L.any (glob one) comps | _ -> False.
-
-ignored rs path = path == ".qrepo" or L.any (fn rule -> ruleMatches rule path) rs.
-
-validPattern rule =
-  (_, pats) = ruleParts rule;
-  not (L.isEmpty pats) and L.all (fn x -> x != "" and x != "." and x != ".." and not (S.contains (chr 0) x)) pats.
+rules _ = readPathOr "" ".qrepoignore" |> Glob.parseRules.
+ignored rs path = path == ".qrepo" or Glob.matchesAny rs path.
+validPattern = Glob.validRule.
 
 # One walk of the working tree.  What QRepo does not version is SKIPPED and
 # reported by `status`, not fatal: a symlink, a device, a FIFO, a nested
@@ -230,7 +185,7 @@ validPattern rule =
 # mid-write -- this process holds the repository lock, so its writer is gone
 # -- and is removed.
 Item = Type (File String String | Skipped String String).
-walk : String -> String -> List String -> List Item .
+walk : String -> String -> List { anchored : Bool, parts : List String } -> List Item .
 walk root rel rs =
   ls rel |> L.concatMap (fn name ->
     path = if rel == "" then name else rel + "/" + name;
