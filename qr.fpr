@@ -5,14 +5,19 @@ Program = use "std/program".
 Clock = use "std/clock".
 Merge = use "merge".
 T = use "text".
-
-Encoding = use "std/encoding".
 Tcp = use "std/tcp".
 ST = use "std/stream".
 PL = use "std/poller".
 Net = use "std/os".
 Proc = use "std/proc".
 Bin = use "std/binary".
+J = use "std/json".
+S = use "std/string".
+L = use "std/list".
+M = use "std/map".
+O = use "std/option".
+R = use "std/result".
+Ord = use "std/order".
 
 # Qfs.sha256 and output moved here.
 Qfs.sha256 : String -> String .
@@ -46,23 +51,21 @@ writePath p s = need (Qfs.write p s 0).
 mkdirp p = need (Qfs.mkdir p).
 isDir p = need (Qfs.kind p) == 1.
 ls p = need (Qfs.list p).
-J = use "std/json".
-S = use "std/string".
-L = use "std/list".
-M = use "std/map".
-O = use "std/option".
-Ord = use "std/order".
+
 # string sets are Maps to Unit (std/set is retired in the v1.0 spec)
 keySet : List String -> M.Map String Unit .
-keySet xs = M.fromList Ord.string (L.map (fn x -> (x, Unit)) xs).
+keySet xs = xs |> L.map (fn x -> (x, Unit)) |> M.fromList Ord.string.
 withKeys : List String -> M.Map String Unit -> M.Map String Unit .
 withKeys xs s = M.insertAll (L.map (fn x -> (x, Unit)) xs) s.
 
-need r = case r of Ok x -> x | Err e -> Program.fail 1 e.
-check b e = if b then Unit else Program.fail 1 e.
-text v = case v of J.Text s -> s | _ -> Program.fail 1 "expected JSON string".
+need (Ok x) = x.
+need (Err e) = Program.fail 1 e.
+check True _ = Unit.
+check False e = Program.fail 1 e.
+text (J.Text s) = s.
+text _ = Program.fail 1 "expected JSON string".
 field : String -> J.Value -> J.Value .
-field k j = O.withDefault J.Null (J.field k j).
+field k j = J.field k j |> O.withDefault J.Null.
 obj : List (String, J.Value) -> J.Value .
 obj xs = J.object xs.
 
@@ -72,9 +75,10 @@ encode = J.render.
 parse : String -> J.Value .
 parse s = need (J.parse s).
 pairs : J.Value -> List (String, J.Value) .
-pairs j = case j of J.Object m -> M.entries m | _ -> Program.fail 1 "expected JSON object".
+pairs (J.Object m) = M.entries m.
+pairs _ = Program.fail 1 "expected JSON object".
 meta : String -> String -> String .
-meta root p = ".qrepo/" + p.
+meta _ p = ".qrepo/" + p.
 
 get : String -> String -> String .
 get root p = readPath (meta root p).
@@ -88,8 +92,14 @@ sha bytes = Qfs.sha256 bytes.
 identity : String -> String -> String .
 identity kind body = sha (kind + "\n" + body).
 
+allChars pred s = allCharsGo pred s 0 (strlen s).
+allCharsGo : (Int -> Bool) -> String -> Int -> (rem : Int | measure rem) -> Bool .
+allCharsGo pred s i rem =
+  if rem <= 0 then True
+  else pred (charAt s i) and allCharsGo pred s (i + 1) (rem - 1).
+
 hexChar c = (c >= 48 and c <= 57) or (c >= 97 and c <= 102).
-validId id = strlen id == 64 and L.all hexChar (L.map (charAt id) (L.range 0 63)).
+validId id = strlen id == 64 and allChars hexChar id.
 
 load : String -> String -> String -> String .
 load root kind id =
@@ -114,42 +124,65 @@ save root kind body id =
 objectPath root id = meta root ("objects/" + id).
 fileId path = need (Qfs.hash path 0 -1 "blob\n").
 # an object's kind line, read without its body ("commit\n" is the longest)
-kindAt path = n = need (Qfs.size path); line = need (Qfs.readAt path 0 (if n < 7 then n else 7));
-  if S.startsWith "blob\n" line then "blob" else if S.startsWith "tree\n" line then "tree" else if S.startsWith "commit\n" line then "commit" else "".
+kindAt path =
+  n = need (Qfs.size path);
+  line = need (Qfs.readAt path 0 (if n < 7 then n else 7));
+  if S.startsWith "blob\n" line then "blob"
+  else if S.startsWith "tree\n" line then "tree"
+  else if S.startsWith "commit\n" line then "commit"
+  else "".
+
 presentObject root kind id =
   path = objectPath root id;
   _ = check (validId id and exists path) "missing object {id}";
   check (kindAt path == kind) "object {id} is not a {kind}".
+
 verifyObject root kind id =
   path = objectPath root id;
   _ = check (validId id and exists path) "missing object {id}";
   check (kindAt path == kind and need (Qfs.hash path 0 -1 "") == id) "object integrity failure: {id}".
-storeFile root path id = if exists (objectPath root id) then verifyObject root "blob" id
+
+storeFile root path id =
+  if exists (objectPath root id) then verifyObject root "blob" id
   else need (Qfs.store path 0 -1 "blob\n" (objectPath root id) id).
+
 # a blob into the working tree, replacing what stands there
 checkoutBlob root id path = need (Qfs.extract (objectPath root id) path 5 id).
 
 head : String -> String .
-head root = S.trim (get root "HEAD").
+head root = get root "HEAD" |> S.trim.
 
 record : String -> String -> J.Value .
-record root id = parse (load root "commit" id).
+record root id = load root "commit" id |> parse.
 
 snapshot : String -> String -> J.Value .
-snapshot root id = if id == "" then obj [] else
+snapshot _ "" = obj [].
+snapshot root id =
   rec = record root id;
-  parse (load root "tree" (text (field "root_state" rec))).
+  load root "tree" (text (field "root_state" rec)) |> parse.
 
 # Names no versioned path may use, in any component: the metadata directory
 # under ANY casing (a case-insensitive volume opens .qrepo as .QREPO; posix.c
 # refuses by identity as well, which covers what casing does not), and the
 # names publication gives its temporary files.
 reserved name = S.toLower name == ".qrepo" or S.startsWith ".qr-tmp-" name.
-validPath p = p != "" and not (S.startsWith "/" p) and L.all (fn x -> x != "" and x != "." and x != ".." and not (reserved x)) (S.split "/" p).
-digitsOnly t = t != "" and L.all (fn c -> c >= 48 and c <= 57) (L.map (charAt t) (L.range 0 (strlen t - 1))).
+validPath p =
+  p != "" and not (S.startsWith "/" p)
+  and (p |> S.split "/" |> L.all (fn x -> x != "" and x != "." and x != ".." and not (reserved x))).
+
+digitsOnly t = t != "" and allChars S.isDigit t.
 # ".qr-tmp-<pid>-<serial>", exactly as posix.c names them
-isTemp name = if not (S.startsWith ".qr-tmp-" name) then False else (case S.split "-" (substr name 8 (strlen name - 8)) of [a, b] -> digitsOnly a and digitsOnly b | _ -> False).
-rules root = L.filter (fn x -> x != "" and not (S.startsWith "#" x)) (L.map S.trim (S.split "\n" (readPathOr "" (".qrepoignore")))).
+isTemp name | not (S.startsWith ".qr-tmp-" name) = False.
+isTemp name = case S.split "-" (substr name 8 (strlen name - 8)) of
+    [a, b] -> digitsOnly a and digitsOnly b
+  | _ -> False.
+
+rules _ =
+  readPathOr "" ".qrepoignore"
+  |> S.split "\n"
+  |> L.map S.trim
+  |> L.filter (fn x -> x != "" and not (S.startsWith "#" x)).
+
 # An ignore rule is a pattern of path components.  In a component, `*`
 # matches any run of bytes and `?` one byte; nothing else is special.  A rule
 # with no "/" but a trailing one names a component at ANY depth (".DS_Store",
@@ -158,23 +191,37 @@ rules root = L.filter (fn x -> x != "" and not (S.startsWith "#" x)) (L.map S.tr
 # matches a directory matches everything below it, and the scan does not
 # descend into it.  A trailing "/" is accepted and changes nothing else.
 glob pat name = globGo pat 0 name 0.
-globGo pat i name j = if i == strlen pat then j == strlen name else
-  c = charAt pat i;
-  if c == 42 then (if globGo pat (i + 1) name j then True else if j < strlen name then globGo pat i name (j + 1) else False)
-  else if j < strlen name then (if c == 63 or c == charAt name j then globGo pat (i + 1) name (j + 1) else False) else False.
+globGo pat i name j =
+  if i == strlen pat then j == strlen name
+  else
+    c = charAt pat i;
+    if c == 42 then globGo pat (i + 1) name j or (j < strlen name and globGo pat i name (j + 1))
+    else j < strlen name and (c == 63 or c == charAt name j) and globGo pat (i + 1) name (j + 1).
+
 ruleParts rule =
   bare = if S.endsWith "/" rule then substr rule 0 (strlen rule - 1) else rule;
   anchored = S.startsWith "/" bare or S.contains "/" bare;
-  (anchored, S.split "/" (if S.startsWith "/" bare then substr bare 1 (strlen bare - 1) else bare)).
+  trimmed = if S.startsWith "/" bare then substr bare 1 (strlen bare - 1) else bare;
+  (anchored, S.split "/" trimmed).
+
+prefixMatch : (pats : List String | measure pats) -> List String -> Bool .
 prefixMatch pats comps = case pats of
     [] -> True
-  | p :: ps -> (case comps of [] -> False | c :: cs -> if glob p c then prefixMatch ps cs else False).
-ruleMatches rule path = case ruleParts rule of
-  (anchored, pats) -> if anchored then prefixMatch pats (S.split "/" path)
-    else (case pats of [one] -> L.any (glob one) (S.split "/" path) | _ -> False).
+  | p :: ps -> case comps of
+      [] -> False
+    | c :: cs -> glob p c and prefixMatch ps cs.
+
+ruleMatches rule path =
+  (anchored, pats) = ruleParts rule;
+  comps = S.split "/" path;
+  if anchored then prefixMatch pats comps
+  else case pats of [one] -> L.any (glob one) comps | _ -> False.
+
 ignored rs path = path == ".qrepo" or L.any (fn rule -> ruleMatches rule path) rs.
-validPattern rule = case ruleParts rule of
-  (_, pats) -> not (L.isEmpty pats) and L.all (fn x -> x != "" and x != "." and x != ".." and not (S.contains (chr 0) x)) pats.
+
+validPattern rule =
+  (_, pats) = ruleParts rule;
+  not (L.isEmpty pats) and L.all (fn x -> x != "" and x != "." and x != ".." and not (S.contains (chr 0) x)) pats.
 
 # One walk of the working tree.  What QRepo does not version is SKIPPED and
 # reported by `status`, not fatal: a symlink, a device, a FIFO, a nested
@@ -184,52 +231,59 @@ validPattern rule = case ruleParts rule of
 # -- and is removed.
 Item = Type (File String String | Skipped String String).
 walk : String -> String -> List String -> List Item .
-walk root rel rs = L.concat (L.map (fn name ->
-  path = if rel == "" then name else rel + "/" + name;
-  if ignored rs path then [] else
-  if S.toLower name == ".qrepo" then [Skipped path "a nested repository's metadata"] else
-    kind = need (Qfs.kind path);
-    if kind == 1 then walk root path rs else
-    if kind != 0 then [Skipped path "a symlink or special file"] else
-    if isTemp name then dropTemp path else
-    if reserved name then [Skipped path "a reserved name"]
-    else [File path (fileId path)]) (ls rel)).
+walk root rel rs =
+  ls rel |> L.concatMap (fn name ->
+    path = if rel == "" then name else rel + "/" + name;
+    if ignored rs path then []
+    else if S.toLower name == ".qrepo" then [Skipped path "a nested repository's metadata"]
+    else
+      kind = need (Qfs.kind path);
+      if kind == 1 then walk root path rs
+      else if kind != 0 then [Skipped path "a symlink or special file"]
+      else if isTemp name then dropTemp path
+      else if reserved name then [Skipped path "a reserved name"]
+      else [File path (fileId path)]).
 
 dropTemp path = _ = need (Qfs.remove path); [].
 walkAll root = walk root "" (rules root).
-files items = L.concat (L.map (fn item -> case item of File p id -> [(p, id)] | _ -> []) items).
-skips items = L.concat (L.map (fn item -> case item of Skipped p why -> ["skipped (not versioned): " + p + " -- " + why] | _ -> []) items).
+files items = items |> L.filterMap (fn item -> case item of File p id -> O.Some (p, id) | _ -> O.None).
+skips items = items |> L.filterMap (fn item -> case item of Skipped p why -> O.Some ("skipped (not versioned): " + p + " -- " + why) | _ -> O.None).
 scan : String -> List (String, String) .
-scan root = files (walkAll root).
+scan root = walkAll root |> files.
 
 entry (p, id) = (p, J.Text id).
-key (k, v) = k.
+key (k, _) = k.
 tree : List (String, String) -> J.Value .
-tree files = obj (L.map entry files).
+tree fs = fs |> L.map entry |> obj.
 keys : J.Value -> J.Value -> List String .
-keys a b = M.keys (keySet (L.append (L.map key (pairs a)) (L.map key (pairs b)))).
+keys a b = L.append (L.map key (pairs a)) (L.map key (pairs b)) |> keySet |> M.keys.
 
 changes : J.Value -> J.Value -> List String .
-changes a b = L.filter (fn p -> field p a != field p b) (keys a b).
+changes a b = keys a b |> L.filter (fn p -> field p a != field p b).
 
 status : String -> Unit .
 status root =
   old = snapshot root (head root);
   seen = walkAll root;
-  now = tree (files seen);
+  now = seen |> files |> tree;
   paths = changes old now;
-  _ = L.map print (skips seen);
-  _ = print (if L.isEmpty paths then "clean" else S.join "\n" (L.map (fn p -> (if field p old == J.Null then "A " else if field p now == J.Null then "D " else "M ") + p) paths));
+  _ = L.each print (skips seen);
+  statusLine = fn p -> (if field p old == J.Null then "A " else if field p now == J.Null then "D " else "M ") + p;
+  _ = print (if L.isEmpty paths then "clean" else paths |> L.map statusLine |> S.join "\n");
   if not (exists (meta root "remote.json")) then
     print "sync: local-only; no remote configured"
   else
-    observed = S.trim (readPathOr "" (meta root "REMOTE_HEAD"));
-    print (if observed == head root then "sync: matches last observed remote (use fetch to refresh)" else "sync: differs from last observed remote (use pull/push)").
+    observed = readPathOr "" (meta root "REMOTE_HEAD") |> S.trim;
+    print (if observed == head root then "sync: matches last observed remote (use fetch to refresh)"
+           else "sync: differs from last observed remote (use pull/push)").
 
 # ---- Changes, measured -----------------------------------------------------------
 # A file is text when its first 8 KiB hold no NUL byte; only text is measured
 # in lines (a binary file is never read whole to be measured).
-textAt path offset = n = need (Qfs.size path) - offset; not (S.contains (chr 0) (need (Qfs.readAt path offset (if n < 8192 then n else 8192)))).
+textAt path offset =
+  n = need (Qfs.size path) - offset;
+  not (S.contains (chr 0) (need (Qfs.readAt path offset (if n < 8192 then n else 8192)))).
+
 # one changed path: how it changed, and for text, lines added and removed
 # and how many lines the checkpoint had (an editor can judge "most of it went")
 fileChange root old now p = Sys.arena (fn u ->
@@ -238,18 +292,26 @@ fileChange root old now p = Sys.arena (fn u ->
   before = if isText then (case field p old of J.Text id -> T.linesOf (load root "blob" id) | _ -> []) else [];
   after = if isText and kind != "D" then T.linesOf (readPath p) else [];
   (added, removed) = T.changeCounts before after;
-  obj [("path", J.Text p), ("change", J.Text kind), ("text", J.Boolean isText), ("added", J.Integer added), ("removed", J.Integer removed), ("lines", J.Integer (L.length before))]).
+  obj [("path", J.Text p), ("change", J.Text kind), ("text", J.Boolean isText),
+       ("added", J.Integer added), ("removed", J.Integer removed), ("lines", J.Integer (L.length before))]).
+
 # where this repository stands against the remote head it last saw
-syncState root = if not (exists (meta root "remote.json")) then "local-only" else
+syncState root | not (exists (meta root "remote.json")) = "local-only".
+syncState root =
   local = head root;
-  remote = S.trim (readPathOr "" (meta root "REMOTE_HEAD"));
-  if local == remote then "same" else if isAncestor root remote local then "ahead" else if isAncestor root local remote then "behind" else "diverged".
+  remote = readPathOr "" (meta root "REMOTE_HEAD") |> S.trim;
+  if local == remote then "same"
+  else if isAncestor root remote local then "ahead"
+  else if isAncestor root local remote then "behind"
+  else "diverged".
+
 statusJson root =
   old = snapshot root (head root);
   seen = walkAll root;
-  now = tree (files seen);
+  now = seen |> files |> tree;
   paths = changes old now;
-  print (encode (obj [("head", J.Text (head root)), ("device", J.Text (device root)), ("sync", J.Text (syncState root)),
+  print (encode (obj [
+    ("head", J.Text (head root)), ("device", J.Text (device root)), ("sync", J.Text (syncState root)),
     ("conflicts", J.Boolean (exists (meta root "conflicts.json"))),
     ("changes", J.Sequence (L.map (fileChange root old now) paths)),
     ("skipped", J.Sequence (L.map J.Text (skips seen)))])).
@@ -261,8 +323,9 @@ init : String -> Unit .
 defaultIgnore = "# Not versioned here.  One pattern a line: a bare name matches at any depth,\n# with * and ? as wildcards; a pattern with a / is anchored at the root; NAME/\n# is a directory.  This file is versioned like any other: edit it freely.\n# macOS\n.DS_Store\n._*\n.Spotlight-V100/\n.Trashes/\n.fseventsd/\n.TemporaryItems/\n# Office and LibreOffice, while a document is open\n~$*\n.~lock.*#\n# editors' swap and backup files\n*.swp\n*.swo\n*~\n.#*\n# Windows\nThumbs.db\ndesktop.ini\n# downloads still in progress\n*.crdownload\n*.part\n*.download/\n".
 init root =
   _ = initStore root;
-  _ = (if exists ".qrepoignore" then Unit else writePath ".qrepoignore" defaultIgnore);
+  _ = if exists ".qrepoignore" then Unit else writePath ".qrepoignore" defaultIgnore;
   print "initialized native local QRepo (format 2)".
+
 initStore root =
   _ = check (not (exists (meta root "config.json"))) "already initialized";
   _ = mkdirp (meta root "objects");
@@ -274,65 +337,81 @@ initStore root =
 # device       the name its commits carry as their author ("local" until set)
 # merge-rules  "on": the text merge's rules (text.fpr) resolve concurrent
 #              insertions and same-length edits to different lines
-configValue root key = field key (parse (get root "config.json")).
+configValue root key = get root "config.json" |> parse |> field key.
 device root = case configValue root "device" of J.Text d -> d | _ -> "local".
 rulesOn root = configValue root "merge-rules" == J.Text "on".
 setConfig root key value =
-  others = L.filter (fn item -> case item of (k, _) -> k != key) (pairs (parse (get root "config.json")));
+  others = get root "config.json" |> parse |> pairs |> L.filter (fn item -> (k, _) = item; k != key);
   put root "config.json" (encode (obj (L.append others [(key, value)]))).
-printable t = t != "" and L.all (fn c -> c >= 32 and c != 127) (L.map (charAt t) (L.range 0 (strlen t - 1))).
-configure root args = case args of
-    [] -> print (encode (parse (get root "config.json")))
-  | ["device", name] -> _ = check (printable name) "a device name is printable text"; setConfig root "device" (J.Text name)
-  | ["merge-rules", "on"] -> setConfig root "merge-rules" (J.Text "on")
-  | ["merge-rules", "off"] -> setConfig root "merge-rules" (J.Text "off")
-  | _ -> Program.fail 2 "qr config [device NAME | merge-rules on|off]".
+
+printable t = t != "" and allChars (fn c -> c >= 32 and c != 127) t.
+
+configure root []                    = get root "config.json" |> parse |> encode |> print.
+configure root ["device", name]      = _ = check (printable name) "a device name is printable text"; setConfig root "device" (J.Text name).
+configure root ["merge-rules", "on"] = setConfig root "merge-rules" (J.Text "on").
+configure root ["merge-rules", "off"] = setConfig root "merge-rules" (J.Text "off").
+configure _ _                        = Program.fail 2 "qr config [device NAME | merge-rules on|off]".
+
+writeCommit root state commitParents message =
+  body = encode state;
+  stateId = identity "tree" body;
+  recBody = encode (obj [
+    ("root_state", J.Text stateId), ("parents", J.Sequence (L.map J.Text commitParents)),
+    ("author", J.Text (device root)), ("timestamp", J.Integer (Clock.now Unit)),
+    ("message", J.Text message), ("metadata", obj [])]);
+  id = identity "commit" recBody;
+  _ = save root "tree" body stateId;
+  _ = save root "commit" recBody id;
+  _ = markMade root id commitParents;
+  id.
 
 commit : String -> String -> Unit .
 commit root message = commitWith root message (if head root == "" then [] else [head root]) False.
-commitWith root message commitParents allowSame = id = makeCommit root message commitParents allowSame; print "local checkpoint: {id}".
+commitWith root message commitParents allowSame =
+  id = makeCommit root message commitParents allowSame;
+  print "local checkpoint: {id}".
+
 makeCommit root message commitParents allowSame =
   _ = check (message != "") "commit message required";
   parent = head root;
   old = snapshot root parent;
-  files = scan root;
-  state = tree files;
+  fs = scan root;
+  state = tree fs;
   _ = check (allowSame or parent == "" or not (L.isEmpty (changes old state))) "nothing changed";
-  body = encode state;
-  stateId = identity "tree" body;
-  rec = obj [("root_state", J.Text stateId), ("parents", J.Sequence (L.map J.Text commitParents)), ("author", J.Text (device root)), ("timestamp", J.Integer (Clock.now Unit)), ("message", J.Text message), ("metadata", obj [])];
-  recBody = encode rec;
-  id = identity "commit" recBody;
-  _ = each (fn item -> case item of (p, key) -> storeFile root p key) files;
-  _ = save root "tree" body stateId;
-  _ = save root "commit" recBody id;
-  _ = markMade root id commitParents;
+  _ = each (fn item -> (p, k) = item; storeFile root p k) fs;
+  id = writeCommit root state commitParents message;
   _ = put root "HEAD" id;
   id.
 
 parents rec = case field "parents" rec of J.Sequence xs -> L.map text xs | _ -> Program.fail 1 "invalid parents".
 
 history : String -> String -> Unit .
-history root id = if id == "" then Unit else
+history _ "" = Unit.
+history root id =
   rec = record root id;
   _ = print (id + " " + text (field "message" rec));
   case parents rec of [] -> Unit | p :: _ -> history root p.
-# the first-parent line, newest first, as JSON
-historyJson root = print (encode (J.Sequence (historyGo root (head root) []))).
-historyGo root id acc = if id == "" then L.reverse acc else
-  rec = record root id;
-  entry = obj [("id", J.Text id), ("message", field "message" rec), ("author", field "author" rec), ("timestamp", field "timestamp" rec), ("parents", field "parents" rec)];
-  historyGo root (case parents rec of [] -> "" | p :: _ -> p) (entry :: acc).
 
-resolveId root name = if name == "HEAD" then head root else if validId name then name else
-  text (field name (parse (get root "tags.json"))).
+# the first-parent line, newest first, as JSON
+historyJson root = historyGo root (head root) [] |> J.Sequence |> encode |> print.
+historyGo _ "" acc = L.reverse acc.
+historyGo root id acc =
+  rec = record root id;
+  entry = obj [("id", J.Text id), ("message", field "message" rec), ("author", field "author" rec),
+               ("timestamp", field "timestamp" rec), ("parents", field "parents" rec)];
+  next = case parents rec of [] -> "" | p :: _ -> p;
+  historyGo root next (entry :: acc).
+
+resolveId root "HEAD" = head root.
+resolveId _ name | validId name = name.
+resolveId root name = get root "tags.json" |> parse |> field name |> text.
 
 tag : String -> String -> Unit .
 tag root name =
   _ = check (name != "" and name != "HEAD" and not (validId name)) "invalid tag name";
   id = head root;
   _ = check (id != "") "no checkpoint to tag";
-  tags = parse (get root "tags.json");
+  tags = get root "tags.json" |> parse;
   _ = check (field name tags == J.Null) "tags are immutable";
   put root "tags.json" (encode (obj (L.append (pairs tags) [(name, J.Text id)]))).
 
@@ -341,19 +420,24 @@ blobAt : String -> String -> String -> String .
 blobAt root rev path =
   _ = check (validPath path) "unsafe path";
   state = snapshot root (resolveId root rev);
-  (case field path state of J.Text id -> id | _ -> Program.fail 1 ("no such file at {rev}: " + path)).
+  case field path state of J.Text id -> id | _ -> Program.fail 1 ("no such file at {rev}: " + path).
+
 # checked whole before the first byte is written: a corrupt object prints nothing
-showFile root rev path = id = blobAt root rev path; _ = verifyObject root "blob" id; need (Qfs.emit (objectPath root id) 5).
+showFile root rev path =
+  id = blobAt root rev path;
+  _ = verifyObject root "blob" id;
+  need (Qfs.emit (objectPath root id) 5).
 
 restore : String -> String -> String -> Bool -> Unit .
 restore root rev path force =
   id = blobAt root rev path;
   baseline = field path (snapshot root (head root));
-  current = if exists (path) then J.Text (fileId path) else J.Null;
+  current = if exists path then J.Text (fileId path) else J.Null;
   _ = check (force or current == baseline or current == J.Null) "restore would overwrite local edits; use --force";
   _ = makeParents (S.split "/" path) "";
   checkoutBlob root id path.
 
+makeParents : (parts : List String | measure parts) -> String -> Unit .
 makeParents parts prefix = case parts of
     [] -> Unit
   | _ :: [] -> Unit
@@ -363,19 +447,20 @@ makeParents parts prefix = case parts of
       makeParents rest path.
 
 ignore : String -> String -> Unit .
-ignore root rule =
+ignore _ rule =
   _ = check (validPattern rule and not (S.startsWith "#" rule)) "ignore expects a pattern: NAME, DIR/, a/b/c or /ROOTED, with * and ?";
-  before = readPathOr "" (".qrepoignore");
-  writePath (".qrepoignore") (before + (if before == "" or S.endsWith "\n" before then "" else "\n") + rule + "\n").
+  before = readPathOr "" ".qrepoignore";
+  sep = if before == "" or S.endsWith "\n" before then "" else "\n";
+  writePath ".qrepoignore" (before + sep + rule + "\n").
 
-diff : String -> List Unit .
+diff : String -> Unit .
 diff root =
   old = snapshot root (head root);
-  now = tree (scan root);
-  L.map (fn p ->
+  now = scan root |> tree;
+  changes old now |> L.each (fn p ->
     before = if field p old == J.Null then "" else load root "blob" (text (field p old));
     after = if field p now == J.Null then "" else readPath p;
-    print ("--- " + p + " (checkpoint)\n" + before + "\n+++ " + p + " (working)\n" + after)) (changes old now).
+    print ("--- " + p + " (checkpoint)\n" + before + "\n+++ " + p + " (working)\n" + after)).
 
 # ---- Remote protocol 3: frames over HTTP -----------------------------------
 # A MESSAGE is a header and objects.  It is frames, each a 4-byte big-endian
@@ -394,39 +479,54 @@ diff root =
 # from that.  The receiver still verifies every hash and the whole graph
 # before any reference moves, so a sender that leaves out too much, or too
 # little, or lies, changes nothing.
-seqValues value = case value of J.Sequence xs -> xs | _ -> Program.fail 1 "expected array".
-portOf value = case S.toInt value of Ok n -> if n > 0 and n < 65536 then n else Program.fail 2 "invalid port" | Err _ -> Program.fail 2 "invalid port".
+seqValues (J.Sequence xs) = xs.
+seqValues _ = Program.fail 1 "expected array".
+
+portOf value = case S.toInt value of
+    Ok n -> if n > 0 and n < 65536 then n else Program.fail 2 "invalid port"
+  | Err _ -> Program.fail 2 "invalid port".
 
 frame : String -> String .
 frame body = Bin.putU32be (strlen body) + body.
+
 countOf : J.Value -> O.Option Int .
-countOf header = case J.field "objects" header of O.Some (J.Integer n) -> (if n >= 0 then O.Some n else O.None) | _ -> O.None.
+countOf header = case J.field "objects" header of
+    O.Some (J.Integer n) -> if n >= 0 then O.Some n else O.None
+  | _ -> O.None.
 
 # a message into a spool file: its header, then each object from the store
 writeMessage : String -> String -> List (String, J.Value) -> List String -> Unit .
 writeMessage root path header ids =
   _ = need (Qfs.append path (frame (encode (obj (L.append header [("objects", J.Integer (L.length ids))])))));
-  _ = each (fn id -> need (Qfs.appendFrame path (objectPath root id))) ids;
-  Unit.
+  each (fn id -> need (Qfs.appendFrame path (objectPath root id))) ids.
+
 # where a message file's frames lie, found four bytes at a time
 spans path = spansGo path 0 (need (Qfs.size path)) [].
-spansGo path at size acc = if at >= size then Ok (L.reverse acc) else
-  if at + 4 > size then Err "truncated frame length" else
-  (case Bin.u32be 0 (need (Qfs.readAt path at 4)) of
+spansGo path at size acc =
+  if at >= size then Ok (L.reverse acc)
+  else if at + 4 > size then Err "truncated frame length"
+  else case Bin.u32be 0 (need (Qfs.readAt path at 4)) of
       O.None -> Err "truncated frame length"
-    | O.Some n -> if at + 4 + n > size then Err "truncated frame" else spansGo path (at + 4 + n) size ((at + 4, n) :: acc)).
+    | O.Some n ->
+        if at + 4 + n > size then Err "truncated frame"
+        else spansGo path (at + 4 + n) size ((at + 4, n) :: acc).
+
 # a message's header, parsed, and the spans of its objects
 readMessage : String -> Result (J.Value, List (Int, Int)) String .
-readMessage path = case spans path of
-    Err why -> Err why
-  | Ok parts -> (case parts of
-        [] -> Err "an empty message"
-      | first :: objects -> (case first of (off, n) ->
-          (case J.parse (need (Qfs.readAt path off n)) of
-              Err _ -> Err "the header is not JSON"
-            | Ok header -> (case countOf header of
-                  O.None -> Err "the header does not say how many objects follow"
-                | O.Some k -> if k != L.length objects then Err "the header's object count is not what arrived" else Ok (header, objects))))).
+readMessage path =
+  spans path
+  |> R.andThen (fn parts -> case parts of
+      [] -> Err "an empty message"
+    | (off, n) :: objects ->
+        need (Qfs.readAt path off n)
+        |> J.parse
+        |> R.mapError (fn u -> "the header is not JSON")
+        |> R.andThen (fn header -> case countOf header of
+            O.None -> Err "the header does not say how many objects follow"
+          | O.Some k ->
+              if k != L.length objects then Err "the header's object count is not what arrived"
+              else Ok (header, objects))).
+
 response values = L.append [("version", J.Integer 3), ("ok", J.Boolean True)] values.
 refusal reason = [("version", J.Integer 3), ("ok", J.Boolean False), ("error", J.Text reason)].
 removeIf p = if exists p then need (Qfs.remove p) else Unit.
@@ -434,21 +534,22 @@ removeIf p = if exists p then need (Qfs.remove p) else Unit.
 clearSpool root dir =
   _ = mkdirp (meta root "spool");
   _ = mkdirp dir;
-  _ = L.map (fn name -> need (Qfs.remove (dir + "/" + name))) (ls dir);
-  Unit.
+  L.each (fn name -> need (Qfs.remove (dir + "/" + name))) (ls dir).
 
 # Each item in an arena of its own: the heap is reclaimed only at such a
 # boundary, so a loop over thousands of files would otherwise hold what
 # every step allocated until the command ends.
-each f xs = _ = L.map (fn x -> Sys.arena (fn u -> f x)) xs; Unit.
+each f xs = L.each (fn x -> Sys.arena (fn u -> f x)) xs.
 
 # Validate a tree before it can supply any working paths or be published.
 validateState state =
-  _ = each (fn item -> case item of (p, id) ->
+  each (fn item ->
+    (p, id) = item;
     _ = check (validPath p and not (S.contains (chr 0) p)) "unsafe remote path";
     _ = check (validId (text id)) "invalid blob id";
-    checkPrefixes (S.split "/" p) "" state) (pairs state);
-  Unit.
+    checkPrefixes (S.split "/" p) "" state) (pairs state).
+
+checkPrefixes : (parts : List String | measure parts) -> String -> J.Value -> Unit .
 checkPrefixes parts prefix state = case parts of
     [] -> Unit
   | _ :: [] -> Unit
@@ -456,6 +557,7 @@ checkPrefixes parts prefix state = case parts of
       p = if prefix == "" then name else prefix + "/" + name;
       _ = check (field p state == J.Null) "file/directory collision in tree";
       checkPrefixes rest p state.
+
 # Every object a commit reaches, its whole history included, and that each
 # is what its tree says.  Commits and trees are hashed as they are loaded.  A
 # blob is hashed once, when it ENTERS the store -- by import, commit or merge,
@@ -464,38 +566,50 @@ checkPrefixes parts prefix state = case parts of
 # (gc, before it removes anything).
 graph root deep todo seen objects = case todo of
     [] -> M.keys objects
-  | id :: rest -> if M.member id seen then graph root deep rest seen objects else
-      # one commit in an arena: out come its parents, its tree, and the blobs not seen before
-      (ps, treeId, fresh) = Sys.arena (fn u -> commitStep root deep id objects);
-      graph root deep (L.append ps rest) (M.insert id Unit seen) (withKeys (id :: treeId :: fresh) objects).
+  | id :: rest ->
+      if M.member id seen then graph root deep rest seen objects
+      else
+        # one commit in an arena: out come its parents, its tree, and the blobs not seen before
+        (ps, treeId, fresh) = Sys.arena (fn u -> commitStep root deep id objects);
+        graph root deep (L.append ps rest) (M.insert id Unit seen) (withKeys (id :: treeId :: fresh) objects).
+
 commitStep root deep id objects =
   rec = record root id;
   ps = parents rec;
   _ = check (L.length ps <= 2 and L.all validId ps) "invalid commit parents";
   treeId = text (field "root_state" rec);
-  state = parse (load root "tree" treeId);
+  state = load root "tree" treeId |> parse;
   _ = validateState state;
-  fresh = L.filter (fn bid -> not (M.member bid objects)) (L.map (fn item -> case item of (_, v) -> text v) (pairs state));
+  fresh = state |> pairs |> L.map (fn item -> (_, v) = item; text v) |> L.filter (fn bid -> not (M.member bid objects));
   _ = each (fn bid -> if deep then verifyObject root "blob" bid else presentObject root "blob" bid) fresh;
   (ps, treeId, fresh).
+
 # an id this store holds as a commit
 isCommit root id = validId id and exists (meta root ("objects/" + id)) and S.startsWith "commit\n" (get root ("objects/" + id)).
+
 # the objects of `tip` that someone holding `haves` lacks: the commits only
 # `tip` reaches (newCommits), their trees, and their blobs, less the blobs the
 # haves' own trees hold.  A blob some older commit of theirs had, and the
 # haves do not, is sent again; the receiver keeps one copy.
-pack root tip haves = if tip == "" then [] else
-  known = isCommit root;
-  hs = L.filter known haves;
+pack _ "" _ = [].
+pack root tip haves =
+  hs = haves |> L.filter (isCommit root);
   fresh = newCommits root tip hs;
-  held = keySet (L.concat (L.map (fn h -> Sys.arena (fn u -> treeObjects root h)) hs));
-  L.filter (fn id -> not (M.member id held)) (M.keys (keySet
-    (L.concat (L.map (fn c -> c :: Sys.arena (fn u -> treeObjects root c)) fresh)))).
+  held = hs |> L.concatMap (fn h -> Sys.arena (fn u -> treeObjects root h)) |> keySet;
+  fresh
+  |> L.concatMap (fn c -> c :: Sys.arena (fn u -> treeObjects root c))
+  |> keySet
+  |> M.keys
+  |> L.filter (fn id -> not (M.member id held)).
+
 # a commit's tree and the blobs it names
-treeObjects root c = rec = record root c; treeId = text (field "root_state" rec);
-  treeId :: L.map (fn item -> case item of (_, v) -> text v) (pairs (parse (load root "tree" treeId))).
+treeObjects root c =
+  rec = record root c;
+  treeId = text (field "root_state" rec);
+  treeId :: (load root "tree" treeId |> parse |> pairs |> L.map (fn item -> (_, v) = item; text v)).
+
 # objects from a message file, each checked by kind and hashed in place
-importSpans root path objects = each (fn sp -> case sp of (off, n) -> importSpan root path off n) objects.
+importSpans root path objects = each (fn sp -> (off, n) = sp; importSpan root path off n) objects.
 importSpan root path off n =
   line = need (Qfs.readAt path off (if n < 7 then n else 7));
   _ = check (S.startsWith "blob\n" line or S.startsWith "tree\n" line or S.startsWith "commit\n" line) "invalid incoming object kind";
@@ -503,7 +617,10 @@ importSpan root path off n =
   dst = objectPath root id;
   if exists dst then check (need (Qfs.hash dst 0 -1 "") == id) "immutable object corruption"
   else need (Qfs.store path off n "" dst id).
-ids value = case value of J.Sequence xs -> L.filter validId (L.concat (L.map (fn x -> case x of J.Text t -> [t] | _ -> []) xs)) | _ -> [].
+
+ids (J.Sequence xs) = xs |> L.filterMap J.asString |> L.filter validId.
+ids _ = [].
+
 # ---- History at scale ------------------------------------------------------------
 # Walking all of history on every sync grows with commits times files; an
 # editor syncs every minute.  Two local caches, as git keeps them, bound it:
@@ -519,92 +636,136 @@ ids value = case value of J.Sequence xs -> L.filter validId (L.concat (L.map (fn
 #   is new.  gc (which checks everything, deeply) rewrites both.
 #
 # Neither is part of the format: deleted, they are rebuilt.
-cacheLine fields = body = S.join " " fields; body + " " + substr (sha body) 0 16 + "\n".
-cacheEntries root name = L.concat (L.map (fn line ->
-  case S.split " " line of
-      [] -> []
-    | parts -> (case L.reverse parts of
-          check :: rev -> body = S.join " " (L.reverse rev); if L.length parts >= 2 and substr (sha body) 0 16 == check then [L.reverse rev] else []
-        | [] -> [])) (S.split "\n" (readPathOr "" (meta root name)))).
-loadGraph root = M.fromList Ord.string (L.concat (L.map (fn f -> case f of
-    [id, gen, ps] -> (case S.toInt gen of Ok n -> [(id, (n, L.filter (fn x -> x != "") (S.split "," ps)))] | Err _ -> [])
-  | _ -> []) (cacheEntries root "graph"))).
+cacheLine fields =
+  body = S.join " " fields;
+  body + " " + substr (sha body) 0 16 + "\n".
+
+parseCacheLine line = case line |> S.split " " |> L.reverse of
+    check :: rev ->
+      fields = L.reverse rev;
+      body = S.join " " fields;
+      if not (L.isEmpty fields) and substr (sha body) 0 16 == check then O.Some fields else O.None
+  | [] -> O.None.
+
+cacheEntries root name =
+  readPathOr "" (meta root name)
+  |> S.split "\n"
+  |> L.filterMap parseCacheLine.
+
+parseGraphEntry [id, gen, ps] = case S.toInt gen of
+    Ok n -> O.Some (id, (n, ps |> S.split "," |> L.filter (fn x -> x != "")))
+  | Err _ -> O.None.
+parseGraphEntry _ = O.None.
+
+loadGraph root =
+  cacheEntries root "graph"
+  |> L.filterMap parseGraphEntry
+  |> M.fromList Ord.string.
+
 # the graph, with entries for these commits and all their ancestors
 withGens root g tips =
   (g2, lines) = gensGo root tips g [];
-  _ = (if L.isEmpty lines then Unit else need (Qfs.append (meta root "graph") (strJoin "" (L.reverse lines))));
+  _ = if L.isEmpty lines then Unit else need (Qfs.append (meta root "graph") (strJoin "" (L.reverse lines)));
   g2.
+
 gensGo root stack g lines = case stack of
     [] -> (g, lines)
-  | id :: rest -> if M.member id g then gensGo root rest g lines else
-      ps = parents (record root id);
-      (case L.filter (fn x -> not (M.member x g)) ps of
-          [] -> gen = 1 + L.fold (fn m x -> case M.get x g of O.Some (n, _) -> (if n > m then n else m) | O.None -> m) 0 ps;
-                gensGo root rest (M.insert id (gen, ps) g) (cacheLine [id, "{gen}", S.join "," ps] :: lines)
-        | missing -> gensGo root (L.append missing stack) g lines).
+  | id :: rest ->
+      if M.member id g then gensGo root rest g lines
+      else
+        ps = parents (record root id);
+        case L.filter (fn x -> not (M.member x g)) ps of
+            [] ->
+              gen = 1 + L.fold (fn m x -> Int.max m (genIn g x)) 0 ps;
+              gensGo root rest (M.insert id (gen, ps) g) (cacheLine [id, "{gen}", S.join "," ps] :: lines)
+          | missing -> gensGo root (L.append missing stack) g lines.
+
 genIn g id = case M.get id g of O.Some (n, _) -> n | O.None -> 0.
 parentsIn g id = case M.get id g of O.Some (_, ps) -> ps | O.None -> [].
 
-isAncestor root older newer = if older == "" or older == newer then True else if newer == "" then False else
+isAncestor _ older newer | older == "" or older == newer = True.
+isAncestor _ _ "" = False.
+isAncestor root older newer =
   g = withGens root (loadGraph root) [older, newer];
-  floor = genIn g older;
-  reachDown g older floor [newer] M.strings.
+  reachDown g older (genIn g older) [newer] M.strings.
+
 reachDown g target floor todo seen = case todo of
     [] -> False
-  | id :: rest -> if id == target then True else
-      if M.member id seen or genIn g id <= floor then reachDown g target floor rest seen
+  | id :: rest ->
+      if id == target then True
+      else if M.member id seen or genIn g id <= floor then reachDown g target floor rest seen
       else reachDown g target floor (L.append (parentsIn g id) rest) (M.insert id Unit seen).
 
 # Two walks at once, newest generation first, each commit carrying flags for
 # which side reaches it.  A queue is a list kept in descending generation.
+enqueue : M.Map String (Int, List String) -> (q : List (Int, String, Int) | measure q) -> String -> Int -> List (Int, String, Int) .
 enqueue g q id flags = case q of
     [] -> [(genIn g id, id, flags)]
-  | (n, x, f) :: rest -> if x == id then (n, x, bor f flags) :: rest
+  | (n, x, f) :: rest ->
+      if x == id then (n, x, bor f flags) :: rest
       else if genIn g id > n or (genIn g id == n and strCmp id x < 0) then (genIn g id, id, flags) :: q
       else (n, x, f) :: enqueue g rest id flags.
+
 # the commits `tip` reaches that no `have` does
 newCommits root tip haves =
   g = withGens root (loadGraph root) (tip :: haves);
   start = L.fold (fn q h -> enqueue g q h 2) (enqueue g [] tip 1) haves;
   newGo g start [].
-newGo g q acc = if L.all (fn e -> case e of (_, _, f) -> f == 2) q then acc else
-  (case q of
+
+newGo g q acc =
+  if L.all (fn e -> (_, _, f) = e; f == 2) q then acc
+  else case q of
       [] -> acc
     | (_, id, f) :: rest ->
         q2 = L.fold (fn qq x -> enqueue g qq x f) rest (parentsIn g id);
-        newGo g q2 (if f == 1 then id :: acc else acc)).
+        newGo g q2 (if f == 1 then id :: acc else acc).
+
 # the nearest commits both reach, none an ancestor of another; as git finds them
 mergeBases root left right =
   g = withGens root (loadGraph root) [left, right];
   found = basesGo g (enqueue g (enqueue g [] left 1) right 2) [];
-  L.filter (fn c -> not (L.any (fn d -> d != c and isAncestor root c d) found)) found.
-basesGo g q acc = if L.all (fn e -> case e of (_, _, f) -> band f 4 != 0) q then acc else
-  (case q of
+  found |> L.filter (fn c -> not (L.any (fn d -> d != c and isAncestor root c d) found)).
+
+basesGo g q acc =
+  if L.all (fn e -> (_, _, f) = e; band f 4 != 0) q then acc
+  else case q of
       [] -> acc
     | (_, id, f) :: rest ->
         both = band f 3 == 3 and band f 4 == 0;
         f2 = if both then bor f 4 else f;
-        basesGo g (L.fold (fn qq x -> enqueue g qq x f2) rest (parentsIn g id)) (if both then id :: acc else acc)).
+        basesGo g (L.fold (fn qq x -> enqueue g qq x f2) rest (parentsIn g id)) (if both then id :: acc else acc).
 
 # A commit made here, every file of it just stored, whose parents are all
 # verified (or that has none) is complete as it stands: mark it so.
-markMade root id ps = if L.all (fn p -> M.member p (loadMarks root)) ps then need (Qfs.append (meta root "verified") (cacheLine [id])) else Unit.
-loadMarks root = keySet (L.concat (L.map (fn f -> case f of [id] -> [id] | _ -> []) (cacheEntries root "verified"))).
+markMade root id ps =
+  marks = loadMarks root;
+  if L.all (fn p -> M.member p marks) ps then need (Qfs.append (meta root "verified") (cacheLine [id])) else Unit.
+
+loadMarks root =
+  cacheEntries root "verified"
+  |> L.filterMap (fn f -> case f of [id] -> O.Some id | _ -> O.None)
+  |> keySet.
+
 # that a commit's whole history is here and sound, checking only what no
 # verified commit already covers
-verified root tip = if tip == "" then Unit else
+verified _ "" = Unit.
+verified root tip =
   marks = loadMarks root;
-  if M.member tip marks then Unit else
+  if M.member tip marks then Unit
+  else
     _ = verifyWalk root [tip] marks M.strings M.strings;
     need (Qfs.append (meta root "verified") (cacheLine [tip])).
+
 verifyWalk root todo marks seen objects = case todo of
     [] -> Unit
-  | id :: rest -> if M.member id seen or M.member id marks then verifyWalk root rest marks (M.insert id Unit seen) objects else
-      # what verified parents hold needs no check again
-      known = L.concat (L.map (fn p -> if M.member p marks then Sys.arena (fn u -> treeObjects root p) else []) (parents (record root id)));
-      objects2 = withKeys known objects;
-      (ps, treeId, fresh) = Sys.arena (fn u -> commitStep root False id objects2);
-      verifyWalk root (L.append ps rest) marks (M.insert id Unit seen) (withKeys (id :: treeId :: fresh) objects2).
+  | id :: rest ->
+      if M.member id seen or M.member id marks then verifyWalk root rest marks (M.insert id Unit seen) objects
+      else
+        # what verified parents hold needs no check again
+        known = parents (record root id) |> L.concatMap (fn p -> if M.member p marks then Sys.arena (fn u -> treeObjects root p) else []);
+        objects2 = withKeys known objects;
+        (ps, treeId, fresh) = Sys.arena (fn u -> commitStep root False id objects2);
+        verifyWalk root (L.append ps rest) marks (M.insert id Unit seen) (withKeys (id :: treeId :: fresh) objects2).
 
 # The worker: ONE request from a spool file, its reply into another, then
 # exit.  The listener runs a fresh one per request, so a request that fails --
@@ -612,25 +773,29 @@ verifyWalk root todo marks seen objects = case todo of
 # allocated goes with it.
 rpc root inPath outPath =
   (request, objects) = need (readMessage inPath);
-  (header, outgoing) = if field "version" request != J.Integer 3 then (refusal "unsupported protocol: this server speaks version 3", [])
+  (header, outgoing) =
+    if field "version" request != J.Integer 3 then (refusal "unsupported protocol: this server speaks version 3", [])
     else rpcOp root (text (field "op" request)) request inPath objects;
   writeMessage root outPath header outgoing.
-rpcOp root "head" request inPath objects = (response [("head", J.Text (head root))], []).
-rpcOp root "fetch" request inPath objects =
+
+rpcOp root "head" _ _ _ = (response [("head", J.Text (head root))], []).
+rpcOp root "fetch" request _ _ =
   tip = head root;
   (response [("head", J.Text tip)], pack root tip (ids (field "have" request))).
 rpcOp root "push" request inPath objects =
   before = head root;
   expected = text (field "expected" request);
   target = text (field "head" request);
-  if before != expected then (refusal "stale push: fetch/pull before retrying", []) else
+  if before != expected then (refusal "stale push: fetch/pull before retrying", [])
+  else
     _ = check (validId target) "invalid push head";
     _ = importSpans root inPath objects;
     _ = verified root target;
-    if not (isAncestor root before target) then (refusal "non-fast-forward push refused", []) else
+    if not (isAncestor root before target) then (refusal "non-fast-forward push refused", [])
+    else
       _ = put root "HEAD" target;
       (response [("head", J.Text target)], []).
-rpcOp root _ request inPath objects = (refusal "unknown operation", []).
+rpcOp _ _ _ _ _ = (refusal "unknown operation", []).
 
 # ---- The server: HTTP/1.1, one request at a time -----------------------------
 # It listens where it is told, 127.0.0.1 unless --address says otherwise.
@@ -642,8 +807,9 @@ rpcOp root _ request inPath objects = (refusal "unknown operation", []).
 # in pieces and is as long as Content-Length says.  Thirty seconds of
 # silence from a peer ends its request.
 loopback address = address == "127.0.0.1" or address == "::1" or address == "localhost".
-serverToken root = S.trim (readPathOr "" (meta root "server-token")).
+serverToken root = readPathOr "" (meta root "server-token") |> S.trim.
 serveDir root = meta root "spool/serve".
+
 # The server's log lines carry the time (UTC), and its current step is kept
 # in .qrepo/serve-state, overwritten at each step.  A server that stops --
 # killed, or halted by the runtime -- leaves its last step there, and the
@@ -651,28 +817,31 @@ serveDir root = meta root "spool/serve".
 # inside one, and which part.  Writing the step never stops the server.
 logLine text = Sys.stderr "{Clock.iso (Clock.now Unit)} {text}\n".
 serveState root text = case Qfs.write (meta root "serve-state") "{Clock.iso (Clock.now Unit)} {text}\n" 0 of _ -> Unit.
+
 listenOn root address port =
   exe = need (Proc.self Unit);
   token = serverToken root;
   _ = check (token != "" or loopback address) "serving on {address} needs a token: run `qr serve-token` first";
-  previous = S.trim (readPathOr "" (meta root "serve-state"));
-  _ = (if previous == "" then Unit else logLine "the previous run's last step: {previous}");
+  previous = readPathOr "" (meta root "serve-state") |> S.trim;
+  _ = if previous == "" then Unit else logLine "the previous run's last step: {previous}";
   _ = clearSpool root (serveDir root);
   listener = need (Tcp.listen address port);
   poller = PL.start Unit;
   access = if token == "" then "no token" else "token required";
   _ = logLine "QRepo listening on {address}:{port} (HTTP, one request at a time, {access})";
   serveLoop exe root token listener poller 0.
+
 # each connection in its own arena: what it allocated goes when it ends
 serveLoop exe root token listener poller n =
   _ = serveState root "accepting (request {n} next)";
   case nextConnection listener poller of
-    Err why -> Program.fail 1 ("the listener stopped: " + why)
-  | Ok (conn, peer) ->
-      _ = serveState root "reading request {n} from {peer}";
-      _ = Sys.arena (fn u -> serveOne exe root token conn n);
-      _ = ST.close conn;
-      serveLoop exe root token listener poller (n + 1).
+      Err why -> Program.fail 1 ("the listener stopped: " + why)
+    | Ok (conn, peer) ->
+        _ = serveState root "reading request {n} from {peer}";
+        _ = Sys.arena (fn u -> serveOne exe root token conn n);
+        _ = ST.close conn;
+        serveLoop exe root token listener poller (n + 1).
+
 # The next connection, waited for on the Poller (std/poller): the wait is a
 # host thread blocked in poll(2), and this actor sleeps in its mailbox.
 # Tcp.accept would poll the listener and sleep 4 ms between looks, which kept
@@ -681,46 +850,54 @@ serveLoop exe root token listener poller n =
 # DEADLOCK.md).  A readiness that is gone by the time of the accept (a
 # client that gave up) waits again; a passing shortage is logged and waited
 # out, as std/tcp does.
-nextConnection listener poller = case listener of Tcp.Listener f ->
-  (case PL.awaitResult f poller of
-      Err why -> Err why
-    | Ok _ -> (case Net.accept f of
-          Ok (c, peer) -> Ok (ST.Stream c, peer)
-        | Err why ->
-            if why == "again" then nextConnection listener poller else
-            if S.startsWith "busy: " why then
-              _ = logLine "accept: {substr why 6 (strlen why - 6)} (still serving)";
-              _ = Sys.sleepUs 20000;
-              nextConnection listener poller
-            else Err why)).
+nextConnection (Tcp.Listener f) poller =
+  PL.awaitResult f poller |> R.andThen (fn u ->
+    case Net.accept f of
+        Ok (c, peer) -> Ok (ST.Stream c, peer)
+      | Err "again" -> nextConnection (Tcp.Listener f) poller
+      | Err why ->
+          if S.startsWith "busy: " why then
+            _ = logLine "accept: {substr why 6 (strlen why - 6)} (still serving)";
+            _ = Sys.sleepUs 20000;
+            nextConnection (Tcp.Listener f) poller
+          else Err why).
+
 serveOne exe root token conn n = case readHead conn "" of
     Err "too large" -> reply conn 431 "the request head is larger than 64 KiB"
   | Err _ -> Unit
   | Ok (headText, rest) -> handle exe root token conn headText rest n.
+
 # the request head, and whatever of the body came with it
 readHead conn acc =
   i = strIndexOf "\r\n\r\n" acc;
-  if i >= 0 then Ok (substr acc 0 i, substr acc (i + 4) (strlen acc - i - 4)) else
-  if strlen acc > 65536 then Err "too large" else
-  (case ST.readWithin 30000 65536 conn of
-      Err why -> Err why
-    | Ok more -> if strlen more == 0 then Err "closed" else readHead conn (acc + more)).
-headerOf name lines = case L.filter (fn l -> i = strIndexOf ":" l; i > 0 and S.toLower (substr l 0 i) == name) lines of
-    [] -> ""
-  | l :: _ -> i = strIndexOf ":" l; S.trim (substr l (i + 1) (strlen l - i - 1)).
+  if i >= 0 then Ok (substr acc 0 i, substr acc (i + 4) (strlen acc - i - 4))
+  else if strlen acc > 65536 then Err "too large"
+  else ST.readWithin 30000 65536 conn |> R.andThen (fn more ->
+    if strlen more == 0 then Err "closed" else readHead conn (acc + more)).
+
+headerOf name lines =
+  lines
+  |> L.find (fn l -> i = strIndexOf ":" l; i > 0 and S.toLower (substr l 0 i) == name)
+  |> O.map (fn l -> i = strIndexOf ":" l; substr l (i + 1) (strlen l - i - 1) |> S.trim)
+  |> O.withDefault "".
+
 authorized token presented = sha ("Bearer " + token) == sha presented.
+
 handle exe root token conn headText rest n = case S.split "\r\n" headText of
     [] -> reply conn 400 "a request line was expected"
   | first :: headers -> (case S.split " " first of
-        [method, target, _] ->
-          if target != "/qrepo" then reply conn 404 "not found: QRepo answers POST /qrepo" else
-          if method != "POST" then reply conn 405 "QRepo answers POST /qrepo" else
-          if token != "" and not (authorized token (headerOf "authorization" headers)) then reply conn 401 "a valid token is required" else
-          if headerOf "transfer-encoding" headers != "" then reply conn 411 "a Content-Length is required" else
-          (case S.toInt (headerOf "content-length" headers) of
-              Err _ -> reply conn 411 "a Content-Length is required"
-            | Ok len -> if len < strlen rest then reply conn 400 "more body than Content-Length says" else exchange exe root conn rest len n)
-      | _ -> reply conn 400 "a request line was expected").
+      [method, target, _] ->
+        if target != "/qrepo" then reply conn 404 "not found: QRepo answers POST /qrepo"
+        else if method != "POST" then reply conn 405 "QRepo answers POST /qrepo"
+        else if token != "" and not (authorized token (headerOf "authorization" headers)) then reply conn 401 "a valid token is required"
+        else if headerOf "transfer-encoding" headers != "" then reply conn 411 "a Content-Length is required"
+        else (case S.toInt (headerOf "content-length" headers) of
+            Err _ -> reply conn 411 "a Content-Length is required"
+          | Ok len ->
+              if len < strlen rest then reply conn 400 "more body than Content-Length says"
+              else exchange exe root conn rest len n)
+    | _ -> reply conn 400 "a request line was expected").
+
 exchange exe root conn rest len n =
   tag = "{n}-" + need (Qfs.random 4);
   inPath = serveDir root + "/in-" + tag;
@@ -728,36 +905,51 @@ exchange exe root conn rest len n =
   _ = need (Qfs.append inPath rest);
   _ = serveState root "receiving request {n}'s body ({len} bytes)";
   got = receiveBody conn inPath (len - strlen rest);
-  _ = (if got == 2 then reply conn 507 "the server could not store the request" else
-    if got != 0 then Unit else
-    runWorker exe root conn inPath outPath n);
+  _ = if got == 2 then reply conn 507 "the server could not store the request"
+      else if got != 0 then Unit
+      else runWorker exe root conn inPath outPath n;
   _ = removeIf inPath;
   removeIf outPath.
+
 runWorker exe root conn inPath outPath n =
   _ = serveState root "running the worker for request {n}";
   case Proc.spawn (Proc.describe [exe, "--root", root, "__rpc", inPath, outPath]) of
       Err why -> reply conn 500 ("the worker did not start: " + why)
     | Ok done ->
         _ = serveState root "replying to request {n}";
-        if done.status == 0 then sendFile conn outPath else reply conn 500 (if done.err == "" then "the request failed" else S.trim done.err).
+        if done.status == 0 then sendFile conn outPath
+        else reply conn 500 (if done.err == "" then "the request failed" else S.trim done.err).
+
 # the rest of a body into its spool file, a piece at a time, each piece in an
 # arena of its own: 0 done, 1 the peer stalled or went, 2 the store failed
-receiveBody conn path remaining = if remaining <= 0 then 0 else
-  got = Sys.arena (fn u -> case ST.readWithin 30000 (if remaining < 65536 then remaining else 65536) conn of
-      Err _ -> 0
-    | Ok bytes -> if strlen bytes == 0 then 0 else (case Qfs.append path bytes of Ok _ -> strlen bytes | Err _ -> -1));
-  if got == 0 then 1 else if got < 0 then 2 else receiveBody conn path (remaining - got).
+receiveBody conn path remaining =
+  if remaining <= 0 then 0
+  else
+    got = Sys.arena (fn u -> case ST.readWithin 30000 (if remaining < 65536 then remaining else 65536) conn of
+        Err _ -> 0
+      | Ok bytes -> if strlen bytes == 0 then 0 else case Qfs.append path bytes of Ok _ -> strlen bytes | Err _ -> -1);
+    if got == 0 then 1
+    else if got < 0 then 2
+    else receiveBody conn path (remaining - got).
+
 sendFile conn path = case Qfs.size path of
     Err why -> reply conn 500 why
   | Ok size ->
-      _ = ST.write ("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n") conn;
+      _ = ST.write "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n" conn;
       sendFrom conn path 0 size.
-sendFrom conn path at size = if at >= size then Unit else
-  k = if size - at < 65536 then size - at else 65536;
-  sent = Sys.arena (fn u -> case Qfs.readAt path at k of
+
+sendChunk conn path at k =
+  Sys.arena (fn u -> case Qfs.readAt path at k of
       Err _ -> False
-    | Ok bytes -> (case ST.write bytes conn of Ok _ -> True | Err _ -> False));
-  if sent then sendFrom conn path (at + k) size else Unit.
+    | Ok bytes -> case ST.write bytes conn of Ok _ -> True | Err _ -> False).
+
+sendFrom : ST.Stream -> String -> Int -> (rem : Int | measure rem) -> Unit .
+sendFrom conn path at rem =
+  if rem <= 0 then Unit
+  else if rem <= 65536 then _ = sendChunk conn path at rem; Unit
+  else if sendChunk conn path at 65536 then sendFrom conn path (at + 65536) (rem - 65536)
+  else Unit.
+
 reasonOf 400 = "Bad Request".
 reasonOf 401 = "Unauthorized".
 reasonOf 404 = "Not Found".
@@ -765,14 +957,16 @@ reasonOf 405 = "Method Not Allowed".
 reasonOf 411 = "Length Required".
 reasonOf 431 = "Request Header Fields Too Large".
 reasonOf 507 = "Insufficient Storage".
-reasonOf _ = "Internal Server Error".
+reasonOf _   = "Internal Server Error".
+
 reply conn code why =
   body = why + "\n";
   extra = if code == 401 then "WWW-Authenticate: Bearer\r\n" else "";
   _ = ST.write ("HTTP/1.1 {code} {reasonOf code}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {strlen body}\r\n" + extra + "Connection: close\r\n\r\n" + body) conn;
   Unit.
+
 makeServerToken root =
-  _ = (if serverToken root != "" then Unit else put root "server-token" (need (Qfs.random 32)));
+  _ = if serverToken root != "" then Unit else put root "server-token" (need (Qfs.random 32));
   print "the server token is in .qrepo/server-token (mode 0600); a client takes it on standard input:\n  qr --root DIR clone URL --token-stdin < server-token".
 
 # ---- The client: curl carries each request -----------------------------------
@@ -783,25 +977,36 @@ makeServerToken root =
 # A remote that cannot be reached in 20 s fails, and so does a transfer that
 # moves nothing for 300 s: after a push is uploaded, nothing moves while the
 # server verifies it, and nginx in front allows the same.
-urlOf arg = if digitsOnly arg then "http://127.0.0.1:{portOf arg}" else
+urlOf arg | digitsOnly arg = "http://127.0.0.1:{portOf arg}".
+urlOf arg =
   _ = check (S.startsWith "http://" arg or S.startsWith "https://" arg) "a remote is a port (on this machine) or an http:// or https:// URL";
-  _ = check (L.all (fn c -> c > 32 and c < 127) (L.map (charAt arg) (L.range 0 (strlen arg - 1)))) "a remote URL is printable ASCII without spaces";
+  _ = check (allChars (fn c -> c > 32 and c < 127) arg) "a remote URL is printable ASCII without spaces";
   if S.endsWith "/" arg then substr arg 0 (strlen arg - 1) else arg.
-remoteUrl root = cfg = parse (get root "remote.json");
-  (case field "url" cfg of
+
+remoteUrl root =
+  cfg = get root "remote.json" |> parse;
+  case field "url" cfg of
       J.Text u -> u
-    | _ -> (case field "port" cfg of J.Integer n -> "http://127.0.0.1:{n}" | _ -> Program.fail 1 "invalid remote configuration")).
+    | _ -> case field "port" cfg of
+        J.Integer n -> "http://127.0.0.1:{n}"
+      | _ -> Program.fail 1 "invalid remote configuration".
+
 configureRemote root url withToken =
   _ = put root "remote.json" (encode (obj [("url", J.Text url)]));
   if withToken then takeToken root else Unit.
+
 takeToken root =
-  token = S.trim (need (ST.readAll (ST.Stream 0)));
-  _ = check (token != "" and L.all (fn c -> c > 32 and c < 127) (L.map (charAt token) (L.range 0 (strlen token - 1)))) "the token on standard input is empty or not printable ASCII";
+  token = need (ST.readAll (ST.Stream 0)) |> S.trim;
+  _ = check (token != "" and allChars (fn c -> c > 32 and c < 127) token) "the token on standard input is empty or not printable ASCII";
   put root "remote-token" token.
+
+remoteErr answer = case field "error" answer of J.Text why -> why | _ -> "remote refused request".
+
 remoteCall root header ids =
   (answer, resp, objects) = remoteAsk root header ids;
-  _ = check (field "ok" answer == J.Boolean True) (case field "error" answer of J.Text why -> why | _ -> "remote refused request");
+  _ = check (field "ok" answer == J.Boolean True) (remoteErr answer);
   (answer, resp, objects).
+
 # a request whose refusal (ok: false) is an answer, not a failure
 remoteAsk root header ids =
   url = remoteUrl root;
@@ -811,32 +1016,36 @@ remoteAsk root header ids =
   resp = dir + "/reply";
   auth = dir + "/auth";
   _ = writeMessage root req (("version", J.Integer 3) :: header) ids;
-  token = S.trim (readPathOr "" (meta root "remote-token"));
-  _ = (if token == "" then Unit else writePath auth ("Authorization: Bearer " + token + "\n"));
+  token = readPathOr "" (meta root "remote-token") |> S.trim;
+  _ = if token == "" then Unit else writePath auth ("Authorization: Bearer " + token + "\n");
   host = fn p -> root + "/" + p;
-  argv = L.concat [["curl", "--silent", "--show-error", "--http1.1", "--connect-timeout", "20", "--speed-time", "300", "--speed-limit", "1",
-    "-X", "POST", "-T", host req, "-H", "Content-Type: application/octet-stream", "-H", "Expect:",
-    "-o", host resp, "-w", "%\{http_code}"], (if token == "" then [] else ["-H", "@" + host auth]), [url + "/qrepo"]];
+  argv = L.concat [
+    ["curl", "--silent", "--show-error", "--http1.1", "--connect-timeout", "20", "--speed-time", "300", "--speed-limit", "1",
+     "-X", "POST", "-T", host req, "-H", "Content-Type: application/octet-stream", "-H", "Expect:",
+     "-o", host resp, "-w", "%\{http_code}"],
+    if token == "" then [] else ["-H", "@" + host auth],
+    [url + "/qrepo"]];
   done = Proc.spawn (Proc.describe argv);
   _ = removeIf auth;
   _ = removeIf req;
-  (case done of
+  case done of
       Err why -> Program.fail 1 ("remote: curl did not run: " + why)
     | Ok d ->
         code = S.trim d.out;
-        if d.status != 0 then Program.fail 1 ("remote: " + S.trim d.err) else
-        if code != "200" then
-          why = S.trim (readPathOr "" resp);
+        if d.status != 0 then Program.fail 1 ("remote: " + S.trim d.err)
+        else if code != "200" then
+          why = readPathOr "" resp |> S.trim;
           _ = removeIf resp;
           Program.fail 1 ("remote: HTTP " + code + ": " + why)
-        else
-        (case readMessage resp of
+        else case readMessage resp of
             Err why -> _ = removeIf resp; Program.fail 1 ("remote: " + why)
           | Ok (answer, objects) ->
               _ = check (field "version" answer == J.Integer 3) "unsupported remote protocol";
-              (answer, resp, objects))).
+              (answer, resp, objects).
+
 # what this repository already holds, to be left out of a transfer
-haves root = L.filter validId [head root, S.trim (readPathOr "" (meta root "REMOTE_HEAD"))].
+haves root = [head root, readPathOr "" (meta root "REMOTE_HEAD") |> S.trim] |> L.filter validId.
+
 fetchRemote root =
   (answer, resp, objects) = remoteCall root [("op", J.Text "fetch"), ("have", J.Sequence (L.map J.Text (haves root)))] [];
   tip = text (field "head" answer);
@@ -846,18 +1055,23 @@ fetchRemote root =
   _ = verified root tip;
   _ = put root "REMOTE_HEAD" tip;
   tip.
+
 push root = case pushTry root of
     Ok target -> print "pushed {target}"
   | Err why -> Program.fail 1 why.
+
 # Ok: pushed.  Err: the remote moved on since it was last seen (stale).
 pushTry root =
   target = head root;
-  expected = S.trim (readPathOr "" (meta root "REMOTE_HEAD"));
+  expected = readPathOr "" (meta root "REMOTE_HEAD") |> S.trim;
   _ = check (target != "") "no checkpoint to push";
   _ = check (isAncestor root expected target) "local history diverged: pull before pushing";
-  (answer, resp, objects) = remoteAsk root [("op", J.Text "push"), ("head", J.Text target), ("expected", J.Text expected)] (pack root target (L.filter validId [expected]));
+  (answer, resp, objects) = remoteAsk root
+    [("op", J.Text "push"), ("head", J.Text target), ("expected", J.Text expected)]
+    (pack root target (L.filter validId [expected]));
   _ = removeIf resp;
-  if field "ok" answer != J.Boolean True then Err (case field "error" answer of J.Text why -> why | _ -> "remote refused request") else
+  if field "ok" answer != J.Boolean True then Err (remoteErr answer)
+  else
     _ = check (field "head" answer == J.Text target) "unexpected push acknowledgement";
     _ = put root "REMOTE_HEAD" target;
     Ok target.
@@ -865,48 +1079,62 @@ pushTry root =
 # Checkout journal supports idempotent completion after an interrupted pull.
 # What stands at a path now: nothing, a file (by its identity), or something a
 # tree cannot hold -- a directory, a link, a device -- which equals no identity.
-currentId path =
-  kind = need (Qfs.kind path);
-  if kind == -1 then J.Null else
-  if kind == 0 then J.Text (fileId path) else
-  if kind == 1 then J.Text "directory" else J.Text "special".
-parentOf path = parts = S.split "/" path; S.join "/" (L.take (L.length parts - 1) parts).
+currentId path = case need (Qfs.kind path) of
+    0 -> J.Text (fileId path)
+  | 1 -> J.Text "directory"
+  | k -> if k == -1 then J.Null else J.Text "special".
+
+parentOf path =
+  parts = S.split "/" path;
+  parts |> L.take (L.length parts - 1) |> S.join "/".
+
 # empty directories are not versioned: when a checkout takes the last file out
 # of one it goes, and so up the path, until one holds something
-prune dir = if dir == "" then Unit else (case Qfs.rmdir dir of Ok _ -> prune (parentOf dir) | Err _ -> Unit).
+prune "" = Unit.
+prune dir = case Qfs.rmdir dir of Ok _ -> prune (parentOf dir) | Err _ -> Unit.
+
 # every file below a directory, ignore rules aside: what replacing it destroys
-below dir = L.concat (L.map (fn name -> p = dir + "/" + name; if need (Qfs.kind p) == 1 then below p else [p]) (ls dir)).
+below dir = ls dir |> L.concatMap (fn name -> p = dir + "/" + name; if need (Qfs.kind p) == 1 then below p else [p]).
+
 # A checkpoint may put a FILE where a directory stands, and the reverse.  The
 # changes are applied deletions first, so the directory is empty and gone
 # before the file is written, and the file is gone before its name becomes a
 # directory.  Each step is idempotent, as recovery needs.
-removeAt root old new path =
+removeAt _ old _ path =
   current = currentId path;
-  if current == J.Null then Unit else
+  if current == J.Null then Unit
+  else
     _ = check (current == field path old) ("checkout interrupted by an edit to " + path);
     _ = need (Qfs.remove path);
     prune (parentOf path).
+
 writeAt root old new path =
   after = field path new;
   stood = currentId path;
-  current = if stood != J.Text "directory" then stood else
-    (case Qfs.rmdir path of Ok _ -> J.Null | Err _ -> Program.fail 1 ("checkout cannot replace directory " + path + ": it is not empty"));
+  current = if stood != J.Text "directory" then stood
+            else case Qfs.rmdir path of
+                Ok _ -> J.Null
+              | Err _ -> Program.fail 1 ("checkout cannot replace directory " + path + ": it is not empty");
   _ = check (current == field path old or current == after or (current == J.Null and stood != J.Null)) ("checkout interrupted by an edit to " + path);
-  if current == after then Unit else
+  if current == after then Unit
+  else
     _ = makeParents (S.split "/" path) "";
     checkoutBlob root (text after) path.
+
 # before anything is written: nothing a checkout would touch may hold work
 # that is not in the checkpoint it replaces
-guard root old new path =
+guard _ old new path =
   current = currentId path;
-  if current == field path old or current == field path new then Unit else
-  if current == J.Text "directory" and field path new != J.Null then
-    (case L.filter (fn f -> not (field f old != J.Null and field f new == J.Null and currentId f == field f old)) (below path) of
-        [] -> Unit
-      | f :: _ -> Program.fail 1 ("checkout would replace directory " + path + ", which holds " + f + " (untracked, ignored or edited)"))
+  if current == field path old or current == field path new then Unit
+  else if current == J.Text "directory" and field path new != J.Null then
+    case below path |> L.find (fn f -> not (field f old != J.Null and field f new == J.Null and currentId f == field f old)) of
+        O.None -> Unit
+      | O.Some f -> Program.fail 1 ("checkout would replace directory " + path + ", which holds " + f + " (untracked, ignored or edited)")
   else Program.fail 1 ("checkout would overwrite an untracked or ignored file: " + path).
-recoverCheckout root = if not (exists (meta root "checkout.json")) then Unit else
-  journal = parse (get root "checkout.json");
+
+recoverCheckout root | not (exists (meta root "checkout.json")) = Unit.
+recoverCheckout root =
+  journal = get root "checkout.json" |> parse;
   before = text (field "before" journal);
   target = text (field "target" journal);
   _ = check (head root == before or head root == target) "checkout journal does not match HEAD";
@@ -920,6 +1148,7 @@ recoverCheckout root = if not (exists (meta root "checkout.json")) then Unit els
   _ = each (writeAt root old new) (L.filter (fn p -> field p new != J.Null) paths);
   _ = put root "HEAD" target;
   need (Qfs.remove (meta root "checkout.json")).
+
 checkout root target =
   before = head root;
   old = snapshot root before;
@@ -936,53 +1165,59 @@ checkout root target =
 # one report names them all.  A file added on both sides merges as text from
 # an empty base.  Each file's work runs in an arena of its own.
 mergeValue root rules oursFirst path base left right =
-  if left == right then Ok left else if base == left then Ok right else if base == right then Ok left else
-    case (left, right) of
+  if left == right then Ok left
+  else if base == left then Ok right
+  else if base == right then Ok left
+  else case (left, right) of
       (J.Text l, J.Text r) -> Sys.arena (fn u -> mergeBodies root rules oursFirst path base l r)
     | _ -> Err (conflictOf path "delete/modify" "one side deleted the file, the other changed it" []).
+
 mergeBodies root rules oursFirst path base l r =
   b = case base of J.Text id -> load root "blob" id | _ -> "";
   lb = load root "blob" l;
   rb = load root "blob" r;
   saved = fn body -> id = identity "blob" body; _ = save root "blob" body id; Ok (J.Text id);
-  json = case base of J.Text _ -> (case (J.parse b, J.parse lb, J.parse rb) of (Ok bv, Ok lv, Ok rv) -> O.Some (bv, lv, rv) | _ -> O.None) | _ -> O.None;
+  json = case base of
+      J.Text _ -> (case (J.parse b, J.parse lb, J.parse rb) of (Ok bv, Ok lv, Ok rv) -> O.Some (bv, lv, rv) | _ -> O.None)
+    | _ -> O.None;
   case json of
       O.Some (bv, lv, rv) -> (case Merge.merge bv lv rv of
           Ok v -> saved (encode v)
         | Err why -> Err (conflictOf path "json" why []))
     | O.None ->
-        if S.contains (chr 0) b or S.contains (chr 0) lb or S.contains (chr 0) rb then Err (conflictOf path "binary" "both sides changed a binary file" []) else
-        (case T.merge3 rules oursFirst (T.linesOf b) (T.linesOf lb) (T.linesOf rb) of
+        if S.contains (chr 0) b or S.contains (chr 0) lb or S.contains (chr 0) rb
+          then Err (conflictOf path "binary" "both sides changed a binary file" [])
+        else case T.merge3 rules oursFirst (T.linesOf b) (T.linesOf lb) (T.linesOf rb) of
             Ok lines -> saved (T.textOf lines)
-          | Err hunks -> Err (conflictOf path "text" "both sides changed the same lines" (L.map hunkJson hunks))).
+          | Err hunks -> Err (conflictOf path "text" "both sides changed the same lines" (L.map hunkJson hunks)).
+
 conflictOf path kind why hunks = obj [("path", J.Text path), ("kind", J.Text kind), ("why", J.Text why), ("hunks", J.Sequence hunks)].
 side at lines = obj [("line", J.Integer at), ("text", J.Sequence (L.map J.Text lines))].
-hunkJson h = case h of T.Hunk i bs a os b ts -> obj [("base", side i bs), ("ours", side a os), ("theirs", side b ts)].
+hunkJson (T.Hunk i bs a os b ts) = obj [("base", side i bs), ("ours", side a os), ("theirs", side b ts)].
+
 mergeStates root rules oursFirst base left right =
-  results = L.map (fn p -> (p, mergeValue root rules oursFirst p (field p base) (field p left) (field p right))) (M.keys (keySet (L.concat [keys base left, keys base right])));
-  conflicts = L.concat (L.map (fn item -> case item of (_, Err c) -> [c] | _ -> []) results);
-  kept = L.concat (L.map (fn item -> case item of (p, Ok v) -> (if v == J.Null then [] else [(p, v)]) | _ -> []) results);
+  allPaths = L.concat [keys base left, keys base right] |> keySet |> M.keys;
+  results = allPaths |> L.map (fn p -> (p, mergeValue root rules oursFirst p (field p base) (field p left) (field p right)));
+  conflicts = results |> L.filterMap (fn item -> case item of (_, Err c) -> O.Some c | _ -> O.None);
+  kept = results |> L.filterMap (fn item -> case item of (p, Ok v) -> if v == J.Null then O.None else O.Some (p, v) | _ -> O.None);
   (obj kept, conflicts).
+
 commonBase root left right = case mergeBases root left right of
     [one] -> one
   | [] -> Program.fail 1 "unrelated histories"
   | _ -> Program.fail 1 "multiple merge bases: manual merge required".
+
 # the merged commit, or every file that conflicts.  With the rules on, lines
 # both sides inserted at one place go the remote's first: they reached the
 # server first.  (Not by commit time: devices' clocks differ, and seconds tie.)
 mergeHeads root left right =
   base = commonBase root left right;
   (state, conflicts) = mergeStates root (rulesOn root) False (snapshot root base) (snapshot root left) (snapshot root right);
-  if not (L.isEmpty conflicts) then Err (base, conflicts) else
+  if not (L.isEmpty conflicts) then Err (base, conflicts)
+  else
     _ = validateState state;
-    body = encode state;
-    sid = identity "tree" body;
-    rec = encode (obj [("root_state", J.Text sid), ("parents", J.Sequence [J.Text left, J.Text right]), ("author", J.Text (device root)), ("timestamp", J.Integer (Clock.now Unit)), ("message", J.Text "Merge remote checkpoint"), ("metadata", obj [])]);
-    id = identity "commit" rec;
-    _ = save root "tree" body sid;
-    _ = save root "commit" rec id;
-    _ = markMade root id [left, right];
-    Ok id.
+    Ok (writeCommit root state [left, right] "Merge remote checkpoint").
+
 # A pull: nothing to do, a fast-forward, a merge, or conflicts.  Conflicts
 # leave HEAD and the working tree as they were, and are recorded in
 # .qrepo/conflicts.json (qr conflicts) until a pull merges or commit-merge
@@ -993,51 +1228,70 @@ pullWith root =
   remote = fetchRemote root;
   # a repository with no checkpoint yet takes the remote's ignore rules in
   # place of the default init wrote, if that is still as written
-  _ = (if local == "" and remote != "" and field ".qrepoignore" (snapshot root remote) != J.Null and exists ".qrepoignore" and readPath ".qrepoignore" == defaultIgnore
-       then need (Qfs.remove ".qrepoignore") else Unit);
+  _ = if local == "" and remote != "" and field ".qrepoignore" (snapshot root remote) != J.Null and exists ".qrepoignore" and readPath ".qrepoignore" == defaultIgnore
+      then need (Qfs.remove ".qrepoignore") else Unit;
   _ = check (L.isEmpty (changes (snapshot root local) (tree (scan root)))) "dirty working copy: commit or restore before pulling";
-  if local == remote or isAncestor root remote local then UpToDate else
-  if isAncestor root local remote then _ = checkout root remote; _ = removeIf (meta root "conflicts.json"); FastForward remote else
-  (case mergeHeads root local remote of
-      Ok id -> _ = checkout root id; _ = removeIf (meta root "conflicts.json"); Merged id
+  if local == remote or isAncestor root remote local then UpToDate
+  else if isAncestor root local remote then
+    _ = checkout root remote;
+    _ = removeIf (meta root "conflicts.json");
+    FastForward remote
+  else case mergeHeads root local remote of
+      Ok id ->
+        _ = checkout root id;
+        _ = removeIf (meta root "conflicts.json");
+        Merged id
     | Err (base, conflicts) ->
-        _ = put root "conflicts.json" (encode (obj [("local", J.Text local), ("remote", J.Text remote), ("base", J.Text base),
-          ("localAuthor", field "author" (record root local)), ("remoteAuthor", field "author" (record root remote)), ("files", J.Sequence conflicts)]));
-        Conflicted conflicts).
+        _ = put root "conflicts.json" (encode (obj [
+          ("local", J.Text local), ("remote", J.Text remote), ("base", J.Text base),
+          ("localAuthor", field "author" (record root local)), ("remoteAuthor", field "author" (record root remote)),
+          ("files", J.Sequence conflicts)]));
+        Conflicted conflicts.
+
+stripNl x = if S.endsWith "\n" x then substr x 0 (strlen x - 1) else x.
+
 # a hunk's side as one line of text: its lines, without their newlines, joined by " / "
-sideText v = case L.map (fn t -> x = text t; if S.endsWith "\n" x then substr x 0 (strlen x - 1) else x) (seqValues (field "text" v)) of
+sideText v = case field "text" v |> seqValues |> L.map (fn t -> t |> text |> stripNl) of
     [] -> "(nothing)"
   | xs -> S.join " / " xs.
-conflictPaths cs = S.join ", " (L.map (fn c -> text (field "path" c)) cs).
+
+conflictPaths cs = cs |> L.map (fn c -> text (field "path" c)) |> S.join ", ".
+
 pull root = case pullWith root of
     UpToDate -> print "up to date (local may be ahead)"
   | FastForward id -> print "pulled {id}"
   | Merged id -> print "merged remote into {id}; push to publish"
   | Conflicted cs -> Program.fail 1 ("merge conflict in " + conflictPaths cs + " (qr conflicts shows where)").
-showConflicts root json = if not (exists (meta root "conflicts.json")) then (if json then print "null" else print "no conflicts") else
-  report = parse (get root "conflicts.json");
-  if json then print (encode report) else
-    _ = L.map (fn c ->
-      _ = print ("conflict in " + text (field "path" c) + " (" + text (field "kind" c) + "): " + text (field "why" c));
-      L.map (fn h ->
-        at = case field "line" (field "ours" h) of J.Integer n -> n + 1 | _ -> 0;
-        _ = print "  at line {at} of this device's version:";
-        L.map (fn which -> print ("    " + S.padRight 8 " " (which + ":") + sideText (field which h))) ["base", "ours", "theirs"]) (seqValues (field "hunks" c))) (seqValues (field "files" report));
-    Unit.
+
+showConflicts root json | not (exists (meta root "conflicts.json")) =
+  print (if json then "null" else "no conflicts").
+showConflicts root True = get root "conflicts.json" |> parse |> encode |> print.
+showConflicts root False =
+  report = get root "conflicts.json" |> parse;
+  field "files" report |> seqValues |> L.each (fn c ->
+    _ = print ("conflict in " + text (field "path" c) + " (" + text (field "kind" c) + "): " + text (field "why" c));
+    field "hunks" c |> seqValues |> L.each (fn h ->
+      at = case field "line" (field "ours" h) of J.Integer n -> n + 1 | _ -> 0;
+      _ = print "  at line {at} of this device's version:";
+      L.each (fn which -> print ("    " + S.padRight 8 " " (which + ":") + sideText (field which h))) ["base", "ours", "theirs"])).
+
 # With conflicts recorded, commit-merge finishes the merge: the conflicting
 # paths as the working tree now has them (the resolution), every other path as
 # the merge made it -- the remote's changes elsewhere included -- committed
 # with both heads as parents and checked out.  Anything else changed in the
 # working tree refuses it: a resolution touches only what conflicted.
 # Without a record, it commits the working tree as the whole resolution.
-commitMerge root message = if exists (meta root "conflicts.json") then finishMerge root message else
+commitMerge root message | exists (meta root "conflicts.json") = finishMerge root message.
+commitMerge root message =
   local = head root;
-  remote = S.trim (get root "REMOTE_HEAD");
+  remote = get root "REMOTE_HEAD" |> S.trim;
   _ = check (local != "" and remote != "" and not (isAncestor root remote local) and not (isAncestor root local remote)) "no divergent fetched remote to resolve";
   _ = verified root remote;
   commitWith root message [local, remote] True.
-conflictRecord root = parse (get root "conflicts.json").
-conflictedPaths rec = L.map (fn c -> text (field "path" c)) (seqValues (field "files" rec)).
+
+conflictRecord root = get root "conflicts.json" |> parse.
+conflictedPaths rec = field "files" rec |> seqValues |> L.map (fn c -> text (field "path" c)).
+
 finishMerge root message =
   _ = check (message != "") "commit message required";
   rec = conflictRecord root;
@@ -1045,26 +1299,22 @@ finishMerge root message =
   remote = text (field "remote" rec);
   _ = check (head root == local) "HEAD moved since the conflict was recorded: sync again";
   _ = verified root remote;
-  conflicted = keySet (conflictedPaths rec);
+  conflicted = conflictedPaths rec |> keySet;
   (merged, _) = mergeStates root (rulesOn root) False (snapshot root (text (field "base" rec))) (snapshot root local) (snapshot root remote);
-  files = scan root;
-  now = tree files;
-  others = L.filter (fn p -> not (M.member p conflicted)) (changes (snapshot root local) now);
+  fs = scan root;
+  now = tree fs;
+  others = changes (snapshot root local) now |> L.filter (fn p -> not (M.member p conflicted));
   _ = check (L.isEmpty others) ("changed outside the conflicting files: " + S.join ", " others + " (commit-merge settles only the conflict)");
-  final = obj (L.append (L.filter (fn item -> case item of (p, _) -> not (M.member p conflicted)) (pairs merged))
-                        (L.concat (L.map (fn p -> case field p now of J.Null -> [] | v -> [(p, v)]) (M.keys conflicted))));
+  nonConflicted = pairs merged |> L.filter (fn item -> (p, _) = item; not (M.member p conflicted));
+  resolved = M.keys conflicted |> L.filterMap (fn p -> case field p now of J.Null -> O.None | v -> O.Some (p, v));
+  final = obj (L.append nonConflicted resolved);
   _ = validateState final;
-  _ = each (fn item -> case item of (p, key) -> if M.member p conflicted then storeFile root p key else Unit) files;
-  body = encode final;
-  sid = identity "tree" body;
-  commitBody = encode (obj [("root_state", J.Text sid), ("parents", J.Sequence [J.Text local, J.Text remote]), ("author", J.Text (device root)), ("timestamp", J.Integer (Clock.now Unit)), ("message", J.Text message), ("metadata", obj [])]);
-  id = identity "commit" commitBody;
-  _ = save root "tree" body sid;
-  _ = save root "commit" commitBody id;
-  _ = markMade root id [local, remote];
+  _ = each (fn item -> (p, k) = item; if M.member p conflicted then storeFile root p k else Unit) fs;
+  id = writeCommit root final [local, remote] message;
   _ = checkoutMerged root id;
   _ = need (Qfs.remove (meta root "conflicts.json"));
   print "merged {id}".
+
 # a checkout whose working tree may already hold what it writes (the guard
 # accepts that); every other path was checked clean by the caller
 checkoutMerged root target =
@@ -1080,27 +1330,28 @@ checkoutMerged root target =
 # version, or its absence.  Then commit-merge.
 resolveFile root path choice =
   rec = conflictRecord root;
-  entry = case L.filter (fn c -> text (field "path" c) == path) (seqValues (field "files" rec)) of
-      c :: _ -> c
-    | [] -> Program.fail 1 ("not in conflict: " + path);
+  entry = case field "files" rec |> seqValues |> L.find (fn c -> text (field "path" c) == path) of
+      O.Some c -> c
+    | O.None -> Program.fail 1 ("not in conflict: " + path);
   kind = text (field "kind" entry);
   version = fn id -> field path (snapshot root (text (field id rec)));
   (b, l, r) = (version "base", version "local", version "remote");
-  pick = (case choice of "ours" -> T.Ours | "theirs" -> T.Theirs | "both" -> T.Both | _ -> Program.fail 2 "resolve PATH ours|theirs|both");
+  pick = case choice of "ours" -> T.Ours | "theirs" -> T.Theirs | "both" -> T.Both | _ -> Program.fail 2 "resolve PATH ours|theirs|both";
   if kind == "text" then
     lines = fn v -> case v of J.Text id -> T.linesOf (load root "blob" id) | _ -> [];
-    body = T.textOf (T.resolve3 pick (rulesOn root) (lines b) (lines l) (lines r));
+    body = T.resolve3 pick (rulesOn root) (lines b) (lines l) (lines r) |> T.textOf;
     id = identity "blob" body;
     _ = save root "blob" body id;
     _ = makeParents (S.split "/" path) "";
     checkoutBlob root id path
   else
     _ = check (choice != "both") ("a " + kind + " conflict keeps one side: ours or theirs");
-    (case (if choice == "ours" then l else r) of
+    case (if choice == "ours" then l else r) of
         J.Text id -> _ = makeParents (S.split "/" path) ""; checkoutBlob root id path
-      | _ -> removeIf path).
+      | _ -> removeIf path.
+
 cloneRepo root url withToken =
-  _ = check (L.isEmpty (L.filter (fn name -> name != ".qrepo") (ls ""))) "clone requires an empty directory";
+  _ = check (ls "" |> L.filter (fn name -> name != ".qrepo") |> L.isEmpty) "clone requires an empty directory";
   _ = initStore root;
   _ = configureRemote root url withToken;
   pull root.
@@ -1116,37 +1367,65 @@ cloneRepo root url withToken =
 # alone until commit-merge.
 # States: local (no remote), synced, conflict (exit 3), behind (the remote
 # kept moving; try again later).
-intOf v = case v of J.Integer n -> n | _ -> 0.
-autoMessage root old now paths = "auto: " + S.join ", " (L.map (fn p ->
-  c = fileChange root old now p;
-  kind = text (field "change" c);
-  if kind == "M" and field "text" c == J.Boolean True then p + " +{intOf (field "added" c)} -{intOf (field "removed" c)}" else kind + " " + p) paths).
-orNull t = if t == "" then J.Null else J.Text t.
+intOf (J.Integer n) = n.
+intOf _ = 0.
+
+autoMessage root old now paths =
+  paths
+  |> L.map (fn p ->
+      c = fileChange root old now p;
+      kind = text (field "change" c);
+      if kind == "M" and field "text" c == J.Boolean True
+        then p + " +{intOf (field "added" c)} -{intOf (field "removed" c)}"
+        else kind + " " + p)
+  |> S.join ", "
+  |> (fn summary -> "auto: " + summary).
+
+orNull "" = J.Null.
+orNull t  = J.Text t.
+
 syncRepo root json =
   pending = exists (meta root "conflicts.json");
   old = snapshot root (head root);
   paths = changes old (tree (scan root));
-  if pending and not (L.isEmpty paths) then syncReport root json "conflict" "" "" "" (seqValues (field "files" (parse (get root "conflicts.json")))) else
-  committed = if L.isEmpty paths then "" else
-    now = tree (scan root);
-    makeCommit root (autoMessage root old now paths) (if head root == "" then [] else [head root]) False;
-  if not (exists (meta root "remote.json")) then syncReport root json "local" committed "" "" [] else
-  syncRound root json committed 2.
-syncRound root json committed tries = case pullWith root of
-    Conflicted cs -> syncReport root json "conflict" committed "" "" cs
-  | pulled ->
-      how = (case pulled of FastForward _ -> "fast-forward" | Merged _ -> "merged" | _ -> "");
-      if head root == "" or head root == S.trim (readPathOr "" (meta root "REMOTE_HEAD")) then syncReport root json "synced" committed how "" [] else
-      (case pushTry root of
-          Ok id -> syncReport root json "synced" committed how id []
-        | Err why -> if tries > 1 then syncRound root json committed (tries - 1) else syncReport root json "behind" committed how "" []).
+  if pending and not (L.isEmpty paths) then
+    syncReport root json "conflict" "" "" "" (seqValues (field "files" (conflictRecord root)))
+  else
+    committed = if L.isEmpty paths then ""
+                else
+                  now = scan root |> tree;
+                  makeCommit root (autoMessage root old now paths) (if head root == "" then [] else [head root]) False;
+    if not (exists (meta root "remote.json")) then syncReport root json "local" committed "" "" []
+    else syncRound root json committed 2.
+
+syncRound : String -> Bool -> String -> (tries : Int | measure tries) -> Unit .
+syncRound root json committed tries =
+  if tries <= 0 then syncReport root json "behind" committed "" "" []
+  else case pullWith root of
+      Conflicted cs -> syncReport root json "conflict" committed "" "" cs
+    | pulled ->
+        how = case pulled of FastForward _ -> "fast-forward" | Merged _ -> "merged" | _ -> "";
+        if head root == "" or head root == (readPathOr "" (meta root "REMOTE_HEAD") |> S.trim)
+          then syncReport root json "synced" committed how "" []
+        else case pushTry root of
+            Ok id -> syncReport root json "synced" committed how id []
+          | Err _ -> if tries > 1 then syncRound root json committed (tries - 1)
+                     else syncReport root json "behind" committed how "" [].
+
 syncReport root json state committed pulled pushed cs =
-  _ = (if json then print (encode (obj [("state", J.Text state), ("committed", orNull committed), ("pulled", orNull pulled), ("pushed", orNull pushed), ("head", J.Text (head root)), ("conflicts", J.Sequence cs)]))
-    else
-      _ = (if committed == "" then Unit else print "committed {committed}");
-      _ = (if pulled == "" then Unit else print "pulled ({pulled})");
-      _ = (if pushed == "" then Unit else print "pushed {pushed}");
-      print (if state == "conflict" then "merge conflict in " + conflictPaths cs + " (qr conflicts shows where)" else if state == "behind" then "the remote kept moving; sync again" else if state == "local" then "no remote configured" else "in sync"));
+  _ = if json then
+        print (encode (obj [
+          ("state", J.Text state), ("committed", orNull committed), ("pulled", orNull pulled),
+          ("pushed", orNull pushed), ("head", J.Text (head root)), ("conflicts", J.Sequence cs)]))
+      else
+        _ = if committed == "" then Unit else print "committed {committed}";
+        _ = if pulled == "" then Unit else print "pulled ({pulled})";
+        _ = if pushed == "" then Unit else print "pushed {pushed}";
+        print (case state of
+            "conflict" -> "merge conflict in " + conflictPaths cs + " (qr conflicts shows where)"
+          | "behind" -> "the remote kept moving; sync again"
+          | "local" -> "no remote configured"
+          | _ -> "in sync");
   if state == "conflict" then Program.exit 3 else Unit.
 
 # ---- Blame --------------------------------------------------------------------
@@ -1157,6 +1436,7 @@ syncReport root json state committed pulled pushed cs =
 # the checkpoint where no parent has it.  Where a parent holds the same file
 # unchanged, every line passes to it without a diff.
 blobIn root c path = Sys.arena (fn u -> case field path (snapshot root c) of J.Text b -> b | _ -> "").
+
 blameFile root path json =
   _ = check (validPath path) "unsafe path";
   tip = head root;
@@ -1165,39 +1445,51 @@ blameFile root path json =
   lines = if exists path then T.linesOf (readPath path) else committed;
   _ = check (exists path or blobId != "") ("no such file: " + path);
   toHead = T.carried committed lines;
-  pending = L.concat (L.map (fn k -> case M.get k toHead of O.Some i -> [(i, k)] | O.None -> []) (L.range 0 (L.length lines - 1)));
-  owners = M.fromList Ord.int (if blobId == "" then [] else blameWalk root path tip blobId pending []);
-  perLine = L.map (fn k -> M.getOr "" k owners) (L.range 0 (L.length lines - 1));
+  pending = L.range 0 (L.length lines - 1) |> L.filterMap (fn k -> M.get k toHead |> O.map (fn i -> (i, k)));
+  owners = (if blobId == "" then [] else blameWalk root path tip blobId pending []) |> M.fromList Ord.int;
+  perLine = L.range 0 (L.length lines - 1) |> L.map (fn k -> M.getOr "" k owners);
+  used = perLine |> L.filter (fn c -> c != "") |> keySet |> M.keys;
   if json then
-    used = M.keys (keySet (L.filter (fn c -> c != "") perLine));
-    info = fn c -> rec = record root c; (c, obj [("author", field "author" rec), ("timestamp", field "timestamp" rec), ("message", field "message" rec)]);
+    info = fn c ->
+      rec = record root c;
+      (c, obj [("author", field "author" rec), ("timestamp", field "timestamp" rec), ("message", field "message" rec)]);
+    ranges = runs perLine 0 [] |> L.map (fn r -> (a, b, c) = r; obj [("start", J.Integer a), ("end", J.Integer b), ("commit", orNull c)]);
     print (encode (obj [("path", J.Text path), ("head", J.Text tip), ("lines", J.Integer (L.length lines)),
-      ("ranges", J.Sequence (L.map (fn r -> case r of (a, b, c) -> obj [("start", J.Integer a), ("end", J.Integer b), ("commit", orNull c)]) (runs perLine 0 []))),
-      ("commits", obj (L.map info used))]))
+                        ("ranges", J.Sequence ranges), ("commits", obj (L.map info used))]))
   else
-    authors = M.fromList Ord.string (L.map (fn c -> (c, text (field "author" (record root c)))) (M.keys (keySet (L.filter (fn c -> c != "") perLine))));
-    _ = L.map (fn pair -> case pair of (c, line) ->
-      print ((if c == "" then "uncommitted        " else substr c 0 8 + " " + S.padRight 10 " " (M.getOr "" c authors)) + " | " + (if S.endsWith "\n" line then substr line 0 (strlen line - 1) else line))) (L.zip perLine lines);
-    Unit.
+    authors = used |> L.map (fn c -> (c, text (field "author" (record root c)))) |> M.fromList Ord.string;
+    L.zip perLine lines |> L.each (fn pair ->
+      (c, line) = pair;
+      prefix = if c == "" then "uncommitted        " else substr c 0 8 + " " + S.padRight 10 " " (M.getOr "" c authors);
+      print (prefix + " | " + stripNl line)).
+
 # Each step loads the two versions and diffs them in an arena of its own;
 # only blob identities and line numbers travel down the history.
-blameWalk root path c blobId pending acc = if L.isEmpty pending then acc else
-  blameParents root path c blobId pending (parents (record root c)) acc.
-blameParents root path c blobId pending ps acc = case ps of
-    [] -> L.append (L.map (fn pk -> case pk of (_, k) -> (k, c)) pending) acc
-  | p :: rest ->
-      pBlob = blobIn root p path;
-      if pBlob == blobId then blameWalk root path p blobId pending acc else
-      if pBlob == "" then blameParents root path c blobId pending rest acc else
-        (inherited, left) = Sys.arena (fn u ->
-          back = T.carried (T.linesOf (load root "blob" pBlob)) (T.linesOf (load root "blob" blobId));
-          (L.concat (L.map (fn pk -> case pk of (i, k) -> (case M.get i back of O.Some j -> [(j, k)] | O.None -> [])) pending),
-           L.filter (fn pk -> case pk of (i, _) -> not (M.member i back)) pending));
-        blameParents root path c blobId left rest (blameWalk root path p pBlob inherited acc).
+blameWalk _ _ _ _ [] acc = acc.
+blameWalk root path c blobId pending acc = blameParents root path c blobId pending (parents (record root c)) acc.
+
+blameParents _ _ c _ pending [] acc = L.append (L.map (fn pk -> (_, k) = pk; (k, c)) pending) acc.
+blameParents root path c blobId pending (p :: rest) acc =
+  pBlob = blobIn root p path;
+  if pBlob == blobId then blameWalk root path p blobId pending acc
+  else if pBlob == "" then blameParents root path c blobId pending rest acc
+  else
+    (inherited, left) = Sys.arena (fn u ->
+      back = T.carried (T.linesOf (load root "blob" pBlob)) (T.linesOf (load root "blob" blobId));
+      (pending |> L.filterMap (fn pk -> (i, k) = pk; M.get i back |> O.map (fn j -> (j, k))),
+       pending |> L.filter (fn pk -> (i, _) = pk; not (M.member i back))));
+    blameParents root path c blobId left rest (blameWalk root path p pBlob inherited acc).
+
 # consecutive lines with one owner, as (start, end exclusive, owner)
-runs owners at acc = case owners of
-    [] -> L.reverse acc
-  | o :: rest -> n = L.length (L.takeWhile (fn x -> x == o) owners); runs (L.drop n owners) (at + n) ((at, at + n, o) :: acc).
+runs [] _ acc = L.reverse acc.
+runs (o :: rest) at acc = runsGo rest o at 1 acc.
+
+runsGo : (xs : List String | measure xs) -> String -> Int -> Int -> List (Int, Int, String) -> List (Int, Int, String) .
+runsGo xs cur start n acc = case xs of
+    [] -> L.reverse ((start, start + n, cur) :: acc)
+  | o :: rest ->
+      if o == cur then runsGo rest cur start (n + 1) acc
+      else runsGo rest o (start + n) 1 ((start, start + n, cur) :: acc).
 
 # ---- Collection ---------------------------------------------------------------
 # What nothing reaches: objects of refused or interrupted transfers, of
@@ -1207,29 +1499,35 @@ runs owners at acc = case owners of
 # missing or corrupt object loses nothing.  History is not pruned: an old
 # version a commit still names is kept.
 gc root =
-  tagIds = L.map (fn item -> case item of (_, v) -> text v) (pairs (parse (get root "tags.json")));
-  journal = if exists (meta root "checkout.json") then (case parse (get root "checkout.json") of j -> [text (field "before" j), text (field "target" j)]) else [];
-  roots = L.filter validId (L.concat [[head root, S.trim (readPathOr "" (meta root "REMOTE_HEAD"))], tagIds, journal]);
-  live = keySet (graph root True roots M.strings M.strings);
-  dead = L.filter (fn name -> not (M.member name live)) (ls (meta root "objects"));
-  bytes = L.sum (L.map (fn name -> need (Qfs.size (meta root ("objects/" + name)))) dead);
+  tagIds = get root "tags.json" |> parse |> pairs |> L.map (fn item -> (_, v) = item; text v);
+  journal = if exists (meta root "checkout.json") then
+              j = get root "checkout.json" |> parse;
+              [text (field "before" j), text (field "target" j)]
+            else [];
+  roots = L.concat [[head root, readPathOr "" (meta root "REMOTE_HEAD") |> S.trim], tagIds, journal] |> L.filter validId;
+  live = graph root True roots M.strings M.strings |> keySet;
+  dead = ls (meta root "objects") |> L.filter (fn name -> not (M.member name live));
+  bytes = dead |> L.map (fn name -> need (Qfs.size (meta root ("objects/" + name)))) |> L.sum;
   _ = each (fn name -> need (Qfs.remove (meta root ("objects/" + name)))) dead;
   # the verified marks: what was just checked deeply, and only what is kept
-  _ = put root "verified" (strJoin "" (L.map (fn c -> cacheLine [c]) (L.filter (fn c -> M.member c live) (L.append (M.keys (loadMarks root)) roots))));
+  keptMarks = L.append (M.keys (loadMarks root)) roots |> L.filter (fn c -> M.member c live) |> L.map (fn c -> cacheLine [c]) |> strJoin "";
+  _ = put root "verified" keptMarks;
   print "removed {L.length dead} unreachable objects ({bytes} bytes); kept {M.size live}".
 
 commands = "init|status [--json]|commit MESSAGE|history [--json]|diff|tag NAME|show REV PATH|restore REV PATH [--force]|ignore PATTERN|gc|config [device NAME|merge-rules on|off]|sync [--json]|blame PATH [--json]|conflicts [--json]|resolve PATH ours|theirs|both|merge-json BASE LEFT RIGHT|serve PORT [--address ADDRESS]|serve-token|clone REMOTE [--token-stdin]|remote REMOTE [--token-stdin]|fetch|pull|push|commit-merge MESSAGE|recover".
-usage u = Program.fail 2 ("usage: qr [--root DIRECTORY] " + commands).
+usage _ = Program.fail 2 ("usage: qr [--root DIRECTORY] " + commands).
+
 run : String -> List String -> Unit .
 run root ["init"] = init root.
 run root ["clone", remote] = cloneRepo root (urlOf remote) False.
 run root ["clone", remote, "--token-stdin"] = cloneRepo root (urlOf remote) True.
 run root args =
-  cfg = parse (get root "config.json");
+  cfg = get root "config.json" |> parse;
   _ = check (field "format" cfg == J.Integer 2) "unsupported QRepo format (native QRepo requires format 2)";
   _ = recoverCheckout root;
   dispatch root args.
-dispatch root ["merge-json", base, left, right] = print (J.render (need (Merge.merge (parse (readPath base)) (parse (readPath left)) (parse (readPath right))))).
+
+dispatch root ["merge-json", base, left, right] = Merge.merge (parse (readPath base)) (parse (readPath left)) (parse (readPath right)) |> need |> J.render |> print.
 dispatch root ["__rpc", inPath, outPath] = rpc root inPath outPath.
 dispatch root ["remote", remote] = configureRemote root (urlOf remote) False.
 dispatch root ["remote", remote, "--token-stdin"] = configureRemote root (urlOf remote) True.
@@ -1253,13 +1551,13 @@ dispatch root ["conflicts", "--json"] = showConflicts root True.
 dispatch root ("config" :: rest) = configure root rest.
 dispatch root ["commit", message] = commit root message.
 dispatch root ["history"] = history root (head root).
-dispatch root ["diff"] = _ = diff root; Unit.
+dispatch root ["diff"] = diff root.
 dispatch root ["tag", name] = tag root name.
 dispatch root ["show", rev, path] = showFile root rev path.
 dispatch root ["restore", rev, path] = restore root rev path False.
 dispatch root ["restore", rev, path, "--force"] = restore root rev path True.
 dispatch root ["ignore", rule] = ignore root rule.
-dispatch root _ = usage Unit.
+dispatch _ _ = usage Unit.
 
 # Main holds the POSIX advisory repository lock until process exit.  The
 # server checks the repository under the lock, then releases it and keeps
@@ -1270,6 +1568,7 @@ runServer root address port =
   _ = Qfs.end Unit;
   _ = listenOn root address (portOf port);
   0.
+
 start root ["serve", port] = runServer root "127.0.0.1" port.
 start root ["serve", port, "--address", address] = runServer root address port.
 start root args =
@@ -1277,8 +1576,9 @@ start root args =
   _ = need (Qfs.begin root initFlag);
   _ = run root args;
   0.
+
 main = case Program.args Unit of
     "--root" :: root :: args -> start root args
-  | "--help" :: [] -> _ = print ("qr [--root DIRECTORY] " + commands); 0
+  | ["--help"] -> _ = print ("qr [--root DIRECTORY] " + commands); 0
   | [] -> Program.fail 2 "usage: qr [--root DIRECTORY] COMMAND ..."
   | args -> start "." args.
